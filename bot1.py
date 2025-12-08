@@ -14,6 +14,13 @@ from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError, PhoneCodeInvalidError
 from telethon.tl.types import InputPeerChannel
 
+# PIL import (rasm siqish uchun) - endi kerak emas
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
 # ========== KONFIGURATSIYA ==========
 ADMIN_ID = 2091226701  # O'zingizning Telegram ID'ingiz
 BOT_TOKEN = "8289173554:AAERukM8xkPMbBZPi2ot8nvPzxC2s5T5xDQ"  # @BotFather dan olingan token
@@ -24,6 +31,15 @@ API_HASH = "de4b653676e085ce3d0f3d64f8741ae4"
 
 # Ommaviy Arxiv Kanal (Media fayllar uchun)
 STORAGE_CHANNEL_USERNAME = "@ajskhdgjasduouwqyuvdqhuq"  # O'z kanalingizni username bilan almashtiring
+
+async def get_storage_channel(bot):
+    try:
+        chat = await bot.get_chat(STORAGE_CHANNEL_USERNAME)
+        return chat.id
+    except Exception as e:
+        logger.error(f"❌ Arxiv kanali topilmadi: {e}")
+        return 'not_set'
+
 
 # Logging yoqish
 logging.basicConfig(
@@ -44,15 +60,7 @@ last_send_time = None
 min_interval = 20  # Minimal interval (daqiqa)
 max_interval = 25  # Maksimal interval (daqiqa)
 random_messages = True  # Random xabarlarni yuborish
-
-# ========== HELPER FUNCTIONS ==========
-
-def get_storage_channel():
-    """Arxiv kanal ID'sini olish"""
-    storage_channel = get_setting('storage_channel', STORAGE_CHANNEL_USERNAME)
-    if storage_channel and storage_channel != 'not_set':
-        return storage_channel
-    return STORAGE_CHANNEL_USERNAME
+session_locks = {}  # Sessionlar uchun locklar
 
 # ========== TELEGRAM CLIENT FUNCTIONS ==========
 
@@ -62,21 +70,27 @@ def init_sessions_dir():
         os.makedirs(SESSIONS_DIR)
         logger.info(f"📁 Sessions papkasi yaratildi: {SESSIONS_DIR}")
 
-def get_session_path(display_name):
-    """Session fayl yo'lini olish"""
-    # Display name'dagi maxsus belgilarni tozalash
-    safe_name = ''.join(c for c in display_name if c.isalnum() or c in ('_', '-'))
-    return os.path.join(SESSIONS_DIR, f"{safe_name}.session")
+def get_session_path(display_name, user_id):
+    """Session fayl yo'lini olish - har bir foydalanuvchi uchun alohida"""
+    if user_id is None:
+        raise ValueError("user_id kiritilmadi!")
+    
+    # Yangi format: userid_displayname.session
+    session_name = f"{user_id}_{display_name}"
+    return os.path.join(SESSIONS_DIR, f"{session_name}.session")
 
-def session_exists(display_name):
+def session_exists(display_name, user_id):
     """Session fayli mavjudligini tekshirish"""
-    session_path = get_session_path(display_name)
+    if user_id is None:
+        return False
+    
+    session_path = get_session_path(display_name, user_id)
     return os.path.exists(session_path)
 
 async def create_and_auth_session(user_id, display_name, phone):
     """Yangi session yaratish va avtorizatsiya qilish"""
     try:
-        session_path = get_session_path(display_name)
+        session_path = get_session_path(display_name, user_id)
         
         # Telefon raqamni tozalash
         if phone.startswith('+'):
@@ -103,10 +117,10 @@ async def create_and_auth_session(user_id, display_name, phone):
                 logger.info(f"📱 {phone} raqamiga kod yuborildi")
                 
                 # SMS kodini bazaga saqlash
-                conn = sqlite3.connect(DB_FILE)
+                conn = sqlite3.connect(DB_FILE, timeout=30)
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT OR REPLACE INTO pending_sessions (display_name, phone, code_hash, user_id, created_at)
+                    INSERT INTO pending_sessions (display_name, phone, code_hash, user_id, created_at)
                     VALUES (?, ?, ?, ?, ?)
                 ''', (display_name, phone, sent_code.phone_code_hash, user_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
                 conn.commit()
@@ -127,7 +141,7 @@ async def create_and_auth_session(user_id, display_name, phone):
                          f"ℹ️ Foydalanuvchi o'zi kodni kiritadi."
                 )
                 
-                return True, f"ENTER_CODE:{display_name}"
+                return True, f"ENTER_CODE:{display_name}:{user_id}"
                 
             except FloodWaitError as e:
                 await client.disconnect()
@@ -143,9 +157,9 @@ async def create_and_auth_session(user_id, display_name, phone):
             await client.disconnect()
             
             # Bazada is_active ni yangilash
-            conn = sqlite3.connect(DB_FILE)
+            conn = sqlite3.connect(DB_FILE, timeout=30)
             cursor = conn.cursor()
-            cursor.execute('UPDATE accounts SET is_active = 1 WHERE display_name = ?', (display_name,))
+            cursor.execute('UPDATE accounts SET is_active = 1 WHERE display_name = ? AND user_id = ?', (display_name, user_id))
             conn.commit()
             conn.close()
             
@@ -155,46 +169,46 @@ async def create_and_auth_session(user_id, display_name, phone):
         logger.error(f"Session yaratishda xato: {e}")
         return False, f"Xato: {str(e)}"
 
-def get_pending_session(display_name):
+def get_pending_session(display_name, user_id):
     """Kutilayotgan session ma'lumotlarini olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
-    cursor.execute('SELECT phone, code_hash, user_id FROM pending_sessions WHERE display_name = ?', (display_name,))
+    cursor.execute('SELECT phone, code_hash FROM pending_sessions WHERE display_name = ? AND user_id = ?', (display_name, user_id))
     result = cursor.fetchone()
     conn.close()
     return result
 
-def remove_pending_session(display_name):
+def remove_pending_session(display_name, user_id):
     """Kutilayotgan sessionni o'chirish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM pending_sessions WHERE display_name = ?', (display_name,))
+    cursor.execute('DELETE FROM pending_sessions WHERE display_name = ? AND user_id = ?', (display_name, user_id))
     conn.commit()
     conn.close()
 
 def get_pending_session_by_user(user_id):
     """Foydalanuvchi uchun kutilayotgan sessionni olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('SELECT display_name, phone, code_hash FROM pending_sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', (user_id,))
     result = cursor.fetchone()
     conn.close()
     return result
 
-async def enter_code(display_name, code):
+async def enter_code(display_name, user_id, code):
     """Kodni kiritish va sessionni tasdiqlash"""
     try:
-        session_path = get_session_path(display_name)
-        
-        if not os.path.exists(session_path):
-            return False, "Session fayli topilmadi"
-        
         # Pending session ma'lumotlarini olish
-        pending_data = get_pending_session(display_name)
+        pending_data = get_pending_session(display_name, user_id)
         if not pending_data:
             return False, "Kutilayotgan session topilmadi"
         
-        phone, code_hash, user_id = pending_data
+        phone, code_hash = pending_data
+        
+        session_path = get_session_path(display_name, user_id)
+        
+        if not os.path.exists(session_path):
+            return False, "Session fayli topilmadi"
         
         # Client yaratish
         client = TelegramClient(
@@ -213,12 +227,12 @@ async def enter_code(display_name, code):
             await client.disconnect()
             
             # Pending sessionni o'chirish
-            remove_pending_session(display_name)
+            remove_pending_session(display_name, user_id)
             
             # Bazada is_active ni yangilash
-            conn = sqlite3.connect(DB_FILE)
+            conn = sqlite3.connect(DB_FILE, timeout=30)
             cursor = conn.cursor()
-            cursor.execute('UPDATE accounts SET is_active = 1 WHERE display_name = ?', (display_name,))
+            cursor.execute('UPDATE accounts SET is_active = 1 WHERE display_name = ? AND user_id = ?', (display_name, user_id))
             conn.commit()
             conn.close()
             
@@ -226,7 +240,7 @@ async def enter_code(display_name, code):
             
         except SessionPasswordNeededError:
             await client.disconnect()
-            return False, f"❗️ **2FA paroli kerak!**\n\nParolni kiriting: `/password {display_name} PAROL`"
+            return False, "❗️ **2FA paroli kerak!**\n\nParolni kiriting: `/password {display_name} PAROL`"
             
         except PhoneCodeInvalidError:
             await client.disconnect()
@@ -240,18 +254,13 @@ async def enter_code(display_name, code):
         logger.error(f"Kod kiritishda xato: {e}")
         return False, f"Xato: {str(e)}"
 
-async def enter_password(display_name, password):
+async def enter_password(display_name, user_id, password):
     """2FA parolini kiritish"""
     try:
-        session_path = get_session_path(display_name)
-        
-        if not os.path.exists(session_path):
-            return False, "Session fayli topilmadi"
-        
         # Hisob ma'lumotlarini olish
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30)
         cursor = conn.cursor()
-        cursor.execute('SELECT phone FROM accounts WHERE display_name = ?', (display_name,))
+        cursor.execute('SELECT phone FROM accounts WHERE display_name = ? AND user_id = ?', (display_name, user_id))
         result = cursor.fetchone()
         conn.close()
         
@@ -259,6 +268,11 @@ async def enter_password(display_name, password):
             return False, "Hisob topilmadi"
         
         phone = result[0]
+        
+        session_path = get_session_path(display_name, user_id)
+        
+        if not os.path.exists(session_path):
+            return False, "Session fayli topilmadi"
         
         # Client yaratish
         client = TelegramClient(
@@ -277,9 +291,9 @@ async def enter_password(display_name, password):
             await client.disconnect()
             
             # Bazada is_active ni yangilash
-            conn = sqlite3.connect(DB_FILE)
+            conn = sqlite3.connect(DB_FILE, timeout=30)
             cursor = conn.cursor()
-            cursor.execute('UPDATE accounts SET is_active = 1 WHERE display_name = ?', (display_name,))
+            cursor.execute('UPDATE accounts SET is_active = 1 WHERE display_name = ? AND user_id = ?', (display_name, user_id))
             conn.commit()
             conn.close()
             
@@ -293,18 +307,13 @@ async def enter_password(display_name, password):
         logger.error(f"Parol kiritishda xato: {e}")
         return False, f"Xato: {str(e)}"
 
-async def test_session(display_name):
+async def test_session(display_name, user_id):
     """Sessionni test qilish"""
     try:
-        session_path = get_session_path(display_name)
-        
-        if not os.path.exists(session_path):
-            return False, "Session fayli topilmadi"
-        
         # Hisob ma'lumotlarini olish
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30)
         cursor = conn.cursor()
-        cursor.execute('SELECT phone FROM accounts WHERE display_name = ?', (display_name,))
+        cursor.execute('SELECT phone FROM accounts WHERE display_name = ? AND user_id = ?', (display_name, user_id))
         result = cursor.fetchone()
         conn.close()
         
@@ -312,6 +321,11 @@ async def test_session(display_name):
             return False, "Hisob topilmadi"
         
         phone = result[0]
+        
+        session_path = get_session_path(display_name, user_id)
+        
+        if not os.path.exists(session_path):
+            return False, "Session fayli topilmadi"
         
         # Client yaratish
         client = TelegramClient(
@@ -340,7 +354,7 @@ async def save_media_to_channel(bot, message, user_id, message_type, file_name=N
     """Media faylni arxiv kanaliga saqlash (lokal diskga yuklamasdan)"""
     try:
         # Arxiv kanalini olish
-        storage_channel = get_storage_channel()
+        storage_channel = await get_storage_channel(bot)
         
         if storage_channel == 'not_set':
             return None, "❌ Arxiv kanali sozlanmagan! Admin: Sozlamalar -> Arxiv kanali"
@@ -414,6 +428,7 @@ async def save_media_to_channel(bot, message, user_id, message_type, file_name=N
         else:
             return None, None
         
+        # CHAT_ID:MESSAGE_ID formatida saqlash
         storage_data = f"{storage_channel}:{sent_message.message_id}"
         
         logger.info(f"📦 Media arxivlandi: {storage_data} (type: {message_type})")
@@ -421,168 +436,195 @@ async def save_media_to_channel(bot, message, user_id, message_type, file_name=N
         
     except Exception as e:
         logger.error(f"Media arxivlashda xato: {e}")
-        return None, f"Media arxivlashda xato: {str(e)}"
+        return None, str(e)
 
-async def send_message_to_group(display_name, group_identifier, message_data):
+async def send_message_to_group(display_name, group_identifier, message_data, user_id):
     """Guruhga xabar yuborish (arxiv kanalidan media o'qib)"""
-    try:
-        session_path = get_session_path(display_name)
-        
-        if not os.path.exists(session_path):
-            return False, "Session fayli topilmadi"
-        
-        # Client yaratish
-        client = TelegramClient(
-            session_path,
-            API_ID,
-            API_HASH
-        )
-        
-        await client.connect()
-        
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            return False, "Session avtorizatsiya qilinmagan"
-        
+    # Lockni olish
+    lock_key = f"{user_id}_{display_name}"
+    if lock_key not in session_locks:
+        session_locks[lock_key] = asyncio.Lock()
+    
+    lock = session_locks[lock_key]
+    async with lock:
         try:
-            # Guruhni topish
-            entity = None
+            session_path = get_session_path(display_name, user_id)
+            if not os.path.exists(session_path):
+                return False, "Session fayli topilmadi"
             
-            if group_identifier.startswith('@'):
-                entity = await client.get_entity(group_identifier)
-            elif group_identifier.startswith('https://t.me/'):
-                username = group_identifier.split('/')[-1]
-                entity = await client.get_entity(f"@{username}")
-            elif group_identifier.startswith('-100'):
-                # Channel/Chat ID
-                entity = await client.get_entity(int(group_identifier))
-            else:
-                # Username sifatida urinib ko'rish
-                try:
-                    entity = await client.get_entity(f"@{group_identifier}")
-                except:
+            # Create client
+            client = TelegramClient(session_path, API_ID, API_HASH)
+            
+            try:
+                await client.connect()
+            except Exception as e:
+                return False, f"Telethon connect error: {e}"
+            
+            # Resolve entity
+            entity = None
+            try:
+                if isinstance(group_identifier, str) and group_identifier.startswith('@'):
+                    entity = await client.get_entity(group_identifier)
+                elif isinstance(group_identifier, str) and group_identifier.startswith('https://t.me/'):
+                    # Agar https://t.me/+U_3Kd4h2whdkNDI0 ko'rinishida bo'lsa
+                    if group_identifier.startswith('https://t.me/+'):
+                        # +U_3Kd4h2whdkNDI0 -> joinchat/U_3Kd4h2whdkNDI0
+                        invite_hash = group_identifier[13:]  # "https://t.me/+" dan keyin
+                        group_identifier = f"https://t.me/joinchat/{invite_hash}"
+                    # Endi group_identifier ni to'g'ridan-to'g'ri get_entity ga beramiz
+                    entity = await client.get_entity(group_identifier)
+                elif isinstance(group_identifier, str) and group_identifier.startswith('+'):
+                    # +U_3Kd4h2whdkNDI0 -> https://t.me/joinchat/U_3Kd4h2whdkNDI0
+                    invite_hash = group_identifier[1:]  # + dan keyin
+                    group_identifier = f"https://t.me/joinchat/{invite_hash}"
+                    entity = await client.get_entity(group_identifier)
+                else:
+                    # try numeric ids or username
                     try:
                         entity = await client.get_entity(int(group_identifier))
                     except:
-                        return False, f"Guruh topilmadi: {group_identifier}"
+                        try:
+                            entity = await client.get_entity(f"@{group_identifier}")
+                        except Exception as e:
+                            await client.disconnect()
+                            return False, f"Guruh topilmadi: {group_identifier}"
+            except Exception as e:
+                await client.disconnect()
+                return False, f"Entity resolve error: {e}"
             
-            # Xabar yuborish - turga qarab
+            # Send message
             if isinstance(message_data, str):
-                # Eski usul - oddiy text
+                # Text message
                 await client.send_message(entity, message_data)
                 await client.disconnect()
                 return True, f"✅ Text xabar yuborildi: {group_identifier}"
-                
             elif isinstance(message_data, dict):
-                message_type = message_data.get('message_type', 'text')
-                storage_data = message_data.get('storage_data')  # CHAT_ID:MESSAGE_ID formatida
-                text = message_data.get('text', '')
+                # Media or archived message
+                storage = message_data.get('storage_data')
+                text = message_data.get('text') or message_data.get('caption') or ""
                 
-                if message_type == 'text':
-                    # Text xabar
-                    await client.send_message(entity, text)
-                    await client.disconnect()
-                    return True, f"✅ Text xabar yuborildi: {group_identifier}"
+                if storage:
+                    # parse CHAT_ID:MESSAGE_ID
+                    parts = str(storage).split(':', 1)
+                    if len(parts) != 2:
+                        await client.disconnect()
+                        return False, "storage_data format bad"
                     
-                elif storage_data:
-                    # Arxiv kanalidan media yuklab olish
+                    chat_s, msg_s = parts
                     try:
-                        # CHAT_ID:MESSAGE_ID ni ajratish
-                        if ':' in storage_data:
-                            chat_id_str, message_id_str = storage_data.split(':')
-                            try:
-                                chat_id = int(chat_id_str) if chat_id_str.lstrip('-').isdigit() else chat_id_str
-                                message_id = int(message_id_str)
-                                
-                                # Arxiv kanalidan xabarni olish
-                                storage_channel = await client.get_entity(chat_id)
-                                
-                                msg = await client.get_messages(storage_channel, ids=message_id)
-                                
-                                if msg:
-                                    # Media bilan birga yuborish
-                                    if msg.photo:
-                                        await client.send_file(entity, msg.photo, caption=text if text else None)
-                                    elif msg.video:
-                                        await client.send_file(entity, msg.video, caption=text if text else None)
-                                    elif msg.document:
-                                        await client.send_file(entity, msg.document, caption=text if text else None)
-                                    elif msg.audio:
-                                        await client.send_file(entity, msg.audio, caption=text if text else None)
-                                    elif msg.voice:
-                                        await client.send_file(entity, msg.voice, caption=text if text else None)
-                                    elif msg.sticker:
-                                        await client.send_file(entity, msg.sticker)
-                                    elif msg.gif:
-                                        await client.send_file(entity, msg.gif, caption=text if text else None)
-                                    elif msg.video_note:
-                                        await client.send_file(entity, msg.video_note, caption=text if text else None)
-                                    else:
-                                        # Agar media topilmasa, text yuborish
-                                        if text:
-                                            await client.send_message(entity, text)
-                                        await client.disconnect()
-                                        return True, f"⚠️ Faqat text yuborildi (media topilmadi): {group_identifier}"
-                                    
-                                    await client.disconnect()
-                                    return True, f"✅ Media xabar yuborildi: {group_identifier}"
-                                else:
-                                    await client.disconnect()
-                                    return False, f"Arxiv kanalida xabar topilmadi: {storage_data}"
-                            except ValueError:
-                                logger.error(f"Noto'g'ri storage_data formati: {storage_data}")
-                                if text:
-                                    await client.send_message(entity, text)
-                                    await client.disconnect()
-                                    return True, f"⚠️ Faqat text yuborildi (arxiv xato): {group_identifier}"
-                                await client.disconnect()
-                                return False, f"Noto'g'ri storage_data formati: {storage_data}"
-                    except Exception as file_error:
-                        logger.error(f"Fayl yuborishda xato: {file_error}")
-                        # Agar fayl bilan yuborib bo'lmasa, text yuboramiz
-                        if text:
-                            await client.send_message(entity, text)
+                        chat_id = int(chat_s) if chat_s.lstrip('-').isdigit() else chat_s
+                        msg_id = int(msg_s)
+                    except:
+                        await client.disconnect()
+                        return False, "storage ids bad"
+                    
+                    # Get archived message
+                    try:
+                        msg = await client.get_messages(chat_id, ids=msg_id)
+                        if not msg:
                             await client.disconnect()
-                            return True, f"⚠️ Faqat text yuborildi (media xato): {group_identifier}"
+                            return False, "Archived message not found"
+                        
+                        # Send the message
+                        if hasattr(msg, 'media') and msg.media:
+                            await client.send_file(entity, msg.media, caption=text or "")
                         else:
-                            await client.disconnect()
-                            return False, f"Fayl yuborib bo'lmadi: {str(file_error)}"
+                            await client.send_message(entity, text or getattr(msg, 'message', '') or "")
+                        
+                        await client.disconnect()
+                        return True, "✅ Forwarded archived message"
+                    except Exception as e:
+                        await client.disconnect()
+                        return False, f"Error forwarding message: {e}"
                 else:
-                    # storage_data yo'q
-                    if text:
-                        await client.send_message(entity, text)
-                        await client.disconnect()
-                        return True, f"✅ Text xabar yuborildi: {group_identifier}"
-                    else:
-                        await client.disconnect()
-                        return False, "Xabar ma'lumotlari noto'g'ri"
+                    # Direct text message
+                    await client.send_message(entity, text or "")
+                    await client.disconnect()
+                    return True, "✅ Message sent"
             else:
                 await client.disconnect()
-                return False, "Noma'lum xabar formati"
-            
+                return False, "Unknown message_data type"
+                
         except Exception as e:
-            await client.disconnect()
-            return False, f"❌ Xabar yuborishda xato: {str(e)}"
-            
-    except Exception as e:
-        logger.error(f"Xabar yuborishda xato: {e}")
-        return False, f"❌ Xato: {str(e)}"
-
-# ========== DATABASE FUNCTIONS ==========
+            # Ensure client is disconnected
+            try:
+                await client.disconnect()
+            except:
+                pass
+            return False, f"send_message_to_group error: {e}"
 
 def init_database():
     """Bazani yaratish"""
     db_exists = os.path.exists(DB_FILE)
     
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
+    
+    # Agar baza mavjud bo'lsa, migratsiya qilish
+    if db_exists:
+        try:
+            cursor.execute('SELECT min_interval FROM accounts LIMIT 1')
+        except sqlite3.OperationalError:
+            # Ustun mavjud emas, qo'shamiz
+            cursor.execute('ALTER TABLE accounts ADD COLUMN min_interval INTEGER DEFAULT 20')
+            cursor.execute('ALTER TABLE accounts ADD COLUMN max_interval INTEGER DEFAULT 25')
+            cursor.execute('ALTER TABLE accounts ADD COLUMN last_sent_time TIMESTAMP')
+            conn.commit()
+            print("✅ Account interval ustunlari qo'shildi")
+        
+        # Messages jadvali migratsiyasi
+        try:
+            cursor.execute('SELECT storage_data FROM messages LIMIT 1')
+        except sqlite3.OperationalError:
+            # storage_data ustuni yo'q, qo'shamiz
+            cursor.execute('ALTER TABLE messages ADD COLUMN storage_data TEXT')
+            conn.commit()
+            print("✅ storage_data ustuni qo'shildi")
+        
+        # Eski file_path va file_hash ustunlarini tekshirish va olib tashlash
+        try:
+            cursor.execute('SELECT file_path FROM messages LIMIT 1')
+            print("⚠️ file_path ustuni mavjud, o'chiriladi...")
+            # Yangi jadval yaratish usuli
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS messages_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    message_type TEXT DEFAULT 'text',
+                    storage_data TEXT,
+                    text TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Ma'lumotlarni ko'chirish
+            cursor.execute('SELECT id, user_id, message_type, text, created_at FROM messages')
+            old_messages = cursor.fetchall()
+            
+            for msg in old_messages:
+                cursor.execute('''
+                    INSERT INTO messages_new (id, user_id, message_type, text, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', msg)
+            
+            # Eski jadvalni o'chirish va yangisini almashtirish
+            cursor.execute('DROP TABLE messages')
+            cursor.execute('ALTER TABLE messages_new RENAME TO messages')
+            conn.commit()
+            print("✅ Messages jadvali yangilandi (storage_data bilan)")
+            
+        except sqlite3.OperationalError:
+            # file_path ustuni yo'q, normal
+            pass
+        
+        print(f"✅ Baza mavjud: {DB_FILE}")
     
     # Jadvalarni yaratish
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
-        display_name TEXT UNIQUE,
+        display_name TEXT NOT NULL,
         phone TEXT,
         country_code TEXT,
         username TEXT,
@@ -590,7 +632,11 @@ def init_database():
         is_premium INTEGER DEFAULT 0,
         is_default INTEGER DEFAULT 0,
         subscription_end DATETIME,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        min_interval INTEGER DEFAULT 20,
+        max_interval INTEGER DEFAULT 25,
+        last_sent_time TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, display_name)
     )''')
     
     cursor.execute('''
@@ -648,11 +694,12 @@ def init_database():
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS pending_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        display_name TEXT UNIQUE,
+        display_name TEXT NOT NULL,
         phone TEXT,
         code_hash TEXT,
-        user_id INTEGER,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        user_id INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, display_name)
     )''')
     
     cursor.execute('''
@@ -670,7 +717,7 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_intervals_user_id ON user_intervals(user_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_pending_sessions_display_name ON pending_sessions(display_name)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_pending_sessions_user_display ON pending_sessions(user_id, display_name)')
     
     # Default sozlamalar
     default_settings = [
@@ -693,7 +740,7 @@ def init_database():
 
 def save_setting(key, value):
     """Setting saqlash"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
     conn.commit()
@@ -701,18 +748,82 @@ def save_setting(key, value):
 
 def get_setting(key, default=None):
     """Setting olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
     result = cursor.fetchone()
     conn.close()
     return result[0] if result else default
 
+# ========== ACCOUNT INTERVAL FUNCTIONS ==========
+
+def set_account_interval(user_id, display_name, min_interval, max_interval):
+    """Hisob uchun interval sozlash"""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE accounts 
+        SET min_interval = ?, max_interval = ? 
+        WHERE user_id = ? AND display_name = ?
+    ''', (min_interval, max_interval, user_id, display_name))
+    conn.commit()
+    conn.close()
+    logger.info(f"✅ Hisob intervali sozlandi: {display_name} -> {min_interval}-{max_interval} daqiqa")
+
+def get_account_interval(user_id, display_name):
+    """Hisob intervalini olish"""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT min_interval, max_interval 
+        FROM accounts 
+        WHERE user_id = ? AND display_name = ?
+    ''', (user_id, display_name))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return result[0], result[1]
+    else:
+        # Agar hisob intervali sozlanmagan bo'lsa, default qiymat
+        return 20, 25
+
+def update_account_last_sent(user_id, display_name):
+    """Hisobning oxirgi yuborish vaqtini yangilash"""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE accounts 
+        SET last_sent_time = ? 
+        WHERE user_id = ? AND display_name = ?
+    ''', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), user_id, display_name))
+    conn.commit()
+    conn.close()
+
+def get_account_last_sent(user_id, display_name):
+    """Hisobning oxirgi yuborish vaqtini olish"""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT last_sent_time 
+        FROM accounts 
+        WHERE user_id = ? AND display_name = ?
+    ''', (user_id, display_name))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result and result[0]:
+        try:
+            return datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
+        except:
+            return None
+    return None
+
 # ========== USER INTERVAL FUNCTIONS ==========
 
 def save_user_interval(user_id, min_interval, max_interval):
     """Foydalanuvchi intervalini saqlash"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('''
         INSERT OR REPLACE INTO user_intervals (user_id, min_interval, max_interval) 
@@ -724,7 +835,7 @@ def save_user_interval(user_id, min_interval, max_interval):
 
 def get_user_interval(user_id):
     """Foydalanuvchi intervalini olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('SELECT min_interval, max_interval FROM user_intervals WHERE user_id = ?', (user_id,))
     result = cursor.fetchone()
@@ -733,23 +844,14 @@ def get_user_interval(user_id):
     if result:
         return result[0], result[1]
     else:
-        # Global sozlamalardan olish
-        global_min = int(get_setting('min_interval', '20'))
-        global_max = int(get_setting('max_interval', '25'))
-        return global_min, global_max
+        # Default interval
+        return 20, 25
 
 def get_next_account_number(user_id):
     """Foydalanuvchi uchun keyingi account raqamini olish (max 5 ta)"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
-    
-    # Foydalanuvchining barcha hisoblarini olish
-    cursor.execute('''
-        SELECT display_name FROM accounts 
-        WHERE user_id = ? 
-        AND display_name LIKE ?
-    ''', (user_id, f'account_{user_id}_%'))
-    
+    cursor.execute('SELECT display_name FROM accounts WHERE user_id = ? AND display_name LIKE "account%"', (user_id,))
     accounts = cursor.fetchall()
     conn.close()
     
@@ -759,10 +861,8 @@ def get_next_account_number(user_id):
     numbers = []
     for acc in accounts:
         try:
-            # Format: account_USERID_NUMBER (account_123456789_1)
-            parts = acc[0].split('_')
-            if len(parts) >= 3 and parts[-1].isdigit():
-                numbers.append(int(parts[-1]))
+            num = int(acc[0].replace("account", ""))
+            numbers.append(num)
         except:
             continue
     
@@ -770,19 +870,13 @@ def get_next_account_number(user_id):
         # Faqat 5 tagacha ruxsat berish
         if len(numbers) >= 5:
             return None  # 5 tadan ko'p bo'lmasligi kerak
-        
-        # 1 dan 5 gacha bo'sh raqamni topish
-        for i in range(1, 6):
-            if i not in numbers:
-                return i
-        
         return max(numbers) + 1
     else:
         return 1
 
 def get_user_accounts_count(user_id):
     """Foydalanuvchi hisoblari soni (default hisoblarni hisoblamaydi)"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) FROM accounts WHERE user_id = ? AND (is_default = 0 OR is_default IS NULL)', (user_id,))
     count = cursor.fetchone()[0]
@@ -797,7 +891,7 @@ def add_user_account(user_id, phone="", country_code="", username="", display_na
         logger.warning(f"Foydalanuvchi {user_id} allaqachon 5 ta hisobga ega")
         return None
     
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     try:
         if not display_name:
@@ -805,30 +899,13 @@ def add_user_account(user_id, phone="", country_code="", username="", display_na
             if account_number is None:
                 logger.warning(f"Foydalanuvchi {user_id} uchun hisob limitiga yetildi (5 ta)")
                 return None
-            
-            # Yangi format: account_USERID_NUMBER
-            display_name = f"account_{user_id}_{account_number}"
-            logger.info(f"🎯 Yangi display name yaratildi: {display_name}")
+            display_name = f"account{account_number}"
         
         # Telefon raqamni tekshirish
         if phone:
-            cursor.execute('SELECT display_name, user_id FROM accounts WHERE phone = ?', (phone,))
-            existing_phone = cursor.fetchone()
-            if existing_phone:
-                logger.warning(f"Bu telefon raqam allaqachon mavjud: {phone} (Hisob: {existing_phone[0]}, User: {existing_phone[1]})")
-                return None
-        
-        # Display name allaqachon mavjudligini tekshirish
-        cursor.execute('SELECT user_id, phone FROM accounts WHERE display_name = ?', (display_name,))
-        existing_name = cursor.fetchone()
-        if existing_name:
-            logger.warning(f"Bu display name allaqachon mavjud: {display_name} (User: {existing_name[0]}, Phone: {existing_name[1]})")
-            # Yangi raqam topish
-            account_number = get_next_account_number(user_id)
-            if account_number:
-                display_name = f"account_{user_id}_{account_number}"
-                logger.info(f"🔄 Yangi display name: {display_name}")
-            else:
+            cursor.execute('SELECT id FROM accounts WHERE phone = ?', (phone,))
+            if cursor.fetchone():
+                logger.warning(f"Bu telefon raqam allaqachon mavjud: {phone}")
                 return None
         
         cursor.execute('''
@@ -837,28 +914,19 @@ def add_user_account(user_id, phone="", country_code="", username="", display_na
         ''', (user_id, display_name, phone, country_code, username))
         conn.commit()
         
-        logger.info(f"✅ Hisob qo'shildi: {display_name} (User: {user_id}, Phone: +{phone})")
+        logger.info(f"✅ Hisob qo'shildi: {display_name} (user: {user_id})")
         
         return display_name
         
     except sqlite3.IntegrityError as e:
-        logger.error(f"Bazaga qo'shishda xato (IntegrityError): {e}")
-        
-        # Qaysi constraint buzilganligini aniqlash
-        if "display_name" in str(e):
-            logger.error(f"Display name conflict: {display_name}")
-            # Barcha mavjud display namelarni ko'rish
-            cursor.execute('SELECT display_name FROM accounts ORDER BY display_name')
-            all_accounts = cursor.fetchall()
-            logger.info(f"Barcha mavjud hisoblar: {all_accounts}")
-            
+        logger.error(f"Bazaga qo'shishda xato: {e}")
         return None
     finally:
         conn.close()
 
 def get_user_accounts(user_id):
     """Foydalanuvchi hisoblarini olish (default hisoblarni ko'rsatmaydi)"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT display_name, phone, country_code, username, is_active, is_premium, subscription_end 
@@ -872,7 +940,7 @@ def get_user_accounts(user_id):
 
 def get_user_by_display_name(display_name):
     """Display name bo'yicha foydalanuvchini topish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('SELECT user_id FROM accounts WHERE display_name = ?', (display_name,))
     result = cursor.fetchone()
@@ -881,7 +949,7 @@ def get_user_by_display_name(display_name):
 
 def get_all_users():
     """Barcha foydalanuvchilarni olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('SELECT DISTINCT user_id FROM accounts WHERE user_id != ?', (ADMIN_ID,))
     users = cursor.fetchall()
@@ -890,7 +958,7 @@ def get_all_users():
 
 def get_all_active_user_ids():
     """Barcha faol obunali foydalanuvchilarni olish (broadcast uchun)"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     cursor.execute('''
@@ -903,7 +971,7 @@ def get_all_active_user_ids():
 
 def get_user_subscription(user_id):
     """Foydalanuvchi obunasini tekshirish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT subscription_end, is_premium FROM accounts 
@@ -921,7 +989,7 @@ def get_user_subscription(user_id):
 
 def update_user_subscription(user_id, days):
     """Foydalanuvchiga obuna berish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     try:
         # subscription_end_str va is_premium ni avvaldan hisoblab qo'yamiz
@@ -971,7 +1039,7 @@ async def delete_user_data_from_channel(user_id, context=None):
     """Foydalanuvchi ma'lumotlarini arxiv kanaldan o'chirish"""
     try:
         # Foydalanuvchining barcha media xabarlarini olish
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30)
         cursor = conn.cursor()
         cursor.execute('SELECT storage_data FROM messages WHERE user_id = ? AND storage_data IS NOT NULL', (user_id,))
         storage_items = cursor.fetchall()
@@ -984,31 +1052,27 @@ async def delete_user_data_from_channel(user_id, context=None):
             if storage_data and ':' in storage_data:
                 try:
                     chat_id_str, message_id_str = storage_data.split(':')
-                    try:
-                        chat_id = int(chat_id_str) if chat_id_str.lstrip('-').isdigit() else chat_id_str
-                        message_id = int(message_id_str)
-                        
-                        # Bot orqali xabarni o'chirish
-                        if context and context.bot:
-                            await context.bot.delete_message(
-                                chat_id=chat_id,
-                                message_id=message_id
-                            )
-                            deleted_count += 1
-                            logger.info(f"🗑️ Arxivdan xabar o'chirildi: {storage_data}")
-                        else:
-                            # Agar context bo'lmasa, bot yaratish
-                            from telegram import Bot
-                            bot = Bot(token=BOT_TOKEN)
-                            await bot.delete_message(
-                                chat_id=chat_id,
-                                message_id=message_id
-                            )
-                            deleted_count += 1
-                            logger.info(f"🗑️ Arxivdan xabar o'chirildi: {storage_data}")
-                    except ValueError:
-                        logger.error(f"Noto'g'ri message_id formati: {message_id_str}")
-                        failed_count += 1
+                    chat_id = int(chat_id_str)
+                    message_id = int(message_id_str)
+                    
+                    # Bot orqali xabarni o'chirish
+                    if context and context.bot:
+                        await context.bot.delete_message(
+                            chat_id=chat_id,
+                            message_id=message_id
+                        )
+                        deleted_count += 1
+                        logger.info(f"🗑️ Arxivdan xabar o'chirildi: {storage_data}")
+                    else:
+                        # Agar context bo'lmasa, bot yaratish
+                        from telegram import Bot
+                        bot = Bot(token=BOT_TOKEN)
+                        await bot.delete_message(
+                            chat_id=chat_id,
+                            message_id=message_id
+                        )
+                        deleted_count += 1
+                        logger.info(f"🗑️ Arxivdan xabar o'chirildi: {storage_data}")
                 except Exception as e:
                     logger.error(f"Xabarni o'chirishda xato ({storage_data}): {e}")
                     failed_count += 1
@@ -1021,13 +1085,30 @@ async def delete_user_data_from_channel(user_id, context=None):
         return 0, 0
 
 def delete_user_data(user_id):
-    """Foydalanuvchi ma'lumotlarini tozalash"""
+    """Foydalanuvchi ma'lumotlarini tozalash (session fayllari bilan)"""
     try:
         user_id = int(user_id)
 
-        conn = sqlite3.connect(DB_FILE)
+        # Avval foydalanuvchining barcha hisoblari uchun session fayllarini o'chirish
+        conn = sqlite3.connect(DB_FILE, timeout=30)
         cursor = conn.cursor()
+        cursor.execute('SELECT display_name FROM accounts WHERE user_id = ?', (user_id,))
+        accounts = cursor.fetchall()
         
+        # Har bir hisob uchun session faylini o'chiramiz
+        for account in accounts:
+            display_name = account[0]
+            session_path = get_session_path(display_name, user_id)
+            if os.path.exists(session_path):
+                os.remove(session_path)
+                logger.info(f"📁 Session fayli o'chirildi: {session_path}")
+            
+            # .session-journal faylini ham o'chirish
+            session_journal = session_path + "-journal"
+            if os.path.exists(session_journal):
+                os.remove(session_journal)
+        
+        # Endi bazadagi ma'lumotlarni o'chirish
         cursor.execute('DELETE FROM accounts WHERE user_id = ?', (user_id,))
         cursor.execute('DELETE FROM groups WHERE user_id = ?', (user_id,))
         cursor.execute('DELETE FROM messages WHERE user_id = ?', (user_id,))
@@ -1036,6 +1117,8 @@ def delete_user_data(user_id):
         
         conn.commit()
         conn.close()
+        
+        logger.info(f"✅ Foydalanuvchi {user_id} barcha ma'lumotlari o'chirildi (session fayllari bilan)")
         return True
 
     except Exception as e:
@@ -1045,7 +1128,7 @@ def delete_user_data(user_id):
 def delete_user_account(user_id, display_name):
     """Foydalanuvchi hisobini o'chirish (session fayli va guruhlar bilan)"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30)
         cursor = conn.cursor()
         
         # Hisobni tekshirish
@@ -1063,13 +1146,13 @@ def delete_user_account(user_id, display_name):
         cursor.execute('DELETE FROM groups WHERE user_id = ? AND account_display_name = ?', (user_id, display_name))
         
         # Pending sessionni o'chirish
-        cursor.execute('DELETE FROM pending_sessions WHERE display_name = ?', (display_name,))
+        cursor.execute('DELETE FROM pending_sessions WHERE display_name = ? AND user_id = ?', (display_name, user_id))
         
         conn.commit()
         conn.close()
         
-        # Session faylini o'chirish
-        session_path = get_session_path(display_name)
+        # Session faylini o'chirish (faqat yangi formatda)
+        session_path = get_session_path(display_name, user_id)
         if os.path.exists(session_path):
             os.remove(session_path)
             logger.info(f"📁 Session fayli o'chirildi: {session_path}")
@@ -1088,7 +1171,7 @@ def delete_user_account(user_id, display_name):
 
 def add_request(user_id, username, first_name, last_name):
     """Yangi so'rov qo'shish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     
     # Avval pending so'rov borligini tekshirish
@@ -1126,7 +1209,7 @@ def add_request(user_id, username, first_name, last_name):
 
 def get_pending_requests():
     """Kutilayotgan so'rovlarni olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT id, user_id, username, first_name, last_name, created_at 
@@ -1142,7 +1225,7 @@ def get_pending_requests():
 
 def get_request_by_id(request_id):
     """So'rovni ID bo'yicha olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM requests WHERE id = ?', (request_id,))
     result = cursor.fetchone()
@@ -1151,7 +1234,7 @@ def get_request_by_id(request_id):
 
 def get_request_by_user_id(user_id):
     """So'rovni user_id bo'yicha olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM requests WHERE user_id = ? AND status = "pending" ORDER BY id DESC LIMIT 1', (user_id,))
     result = cursor.fetchone()
@@ -1160,7 +1243,7 @@ def get_request_by_user_id(user_id):
 
 def update_request_status(request_id, status, admin_note=""):
     """So'rov statusini yangilash"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('UPDATE requests SET status = ?, admin_note = ? WHERE id = ?', (status, admin_note, request_id))
     conn.commit()
@@ -1170,7 +1253,7 @@ def update_request_status(request_id, status, admin_note=""):
 
 def add_group_batch(user_id, account_display_name, groups_list):
     """Ko'p guruhlarni bir vaqtda qo'shish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     
     added_count = 0
@@ -1190,19 +1273,20 @@ def add_group_batch(user_id, account_display_name, groups_list):
         elif group_input.startswith('https://t.me/'):
             group_username = group_input.split('/')[-1]
             if group_username.startswith('+'):
-                group_id = group_username
+                group_id = group_username  # + bilan boshlansa
             else:
                 group_id = f"@{group_username}"
         elif group_input.startswith('-100'):
             group_id = group_input
             group_username = ""
+        elif group_input.startswith('+'):
+            # + bilan boshlangan to'g'ridan-to'g'ri linklar
+            group_id = group_input
+            group_username = ""
         else:
-            if group_input.startswith('+'):
-                group_id = group_input
-                group_username = ""
-            else:
-                group_id = f"@{group_input}"
-                group_username = group_input
+            # Username sifatida qabul qilish
+            group_id = f"@{group_input}"
+            group_username = group_input
         
         try:
             cursor.execute('''
@@ -1225,7 +1309,7 @@ def add_group_batch(user_id, account_display_name, groups_list):
 
 def get_user_groups(user_id, account_display_name):
     """Foydalanuvchi guruhlarini olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT id, group_id, group_title, group_username, is_active 
@@ -1239,7 +1323,7 @@ def get_user_groups(user_id, account_display_name):
 
 def update_group_active_status(group_ids, is_active):
     """Guruhlarning faollik holatini o'zgartirish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     
     updated_count = 0
@@ -1253,7 +1337,7 @@ def update_group_active_status(group_ids, is_active):
 
 def add_user_message(user_id, text, message_type='text', storage_data=None):
     """Foydalanuvchi xabarini qo'shish (arxiv kanal ma'lumoti bilan)"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO messages (user_id, message_type, storage_data, text) 
@@ -1264,7 +1348,7 @@ def add_user_message(user_id, text, message_type='text', storage_data=None):
 
 def get_user_messages(user_id):
     """Foydalanuvchi xabarlarini olish (barcha turlar)"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT id, message_type, storage_data, text 
@@ -1281,19 +1365,28 @@ def get_random_user_message(user_id):
     messages = get_user_messages(user_id)
     if not messages:
         return None
+    
+    # Random xabar tanlash
     msg = random.choice(messages)
-    # (id, message_type, storage_data, text)
-    return {
+    
+    # Message format: (id, message_type, storage_data, text)
+    message_data = {
         'id': msg[0],
         'message_type': msg[1] or 'text',
         'storage_data': msg[2],  # CHAT_ID:MESSAGE_ID formatida
-        'text': msg[3]
+        'text': msg[3] or ""
     }
+    
+    # Agar storage_data bo'lsa, text ni caption sifatida ishlatish
+    if message_data['storage_data'] and message_data['text']:
+        message_data['caption'] = message_data['text']
+    
+    return message_data
 
 def delete_user_messages(user_id):
     """Foydalanuvchi barcha xabarlarini o'chirish (faqat bazadan)"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30)
         cursor = conn.cursor()
         
         cursor.execute('DELETE FROM messages WHERE user_id = ?', (user_id,))
@@ -1309,7 +1402,7 @@ def delete_user_messages(user_id):
 def delete_single_message(message_id):
     """Bitta xabarni o'chirish (faqat bazadan)"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30)
         cursor = conn.cursor()
         
         cursor.execute('DELETE FROM messages WHERE id = ?', (message_id,))
@@ -1324,7 +1417,7 @@ def delete_single_message(message_id):
 def delete_group_by_id(group_id):
     """Guruhni ID bo'yicha o'chirish"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM groups WHERE id = ?', (group_id,))
         deleted = cursor.rowcount > 0
@@ -1337,7 +1430,7 @@ def delete_group_by_id(group_id):
 
 def get_group_by_id(group_id):
     """Guruhni ID bo'yicha olish"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT id, user_id, account_display_name, group_id, group_title, group_username, is_active 
@@ -1350,7 +1443,7 @@ def get_group_by_id(group_id):
 
 def log_session_action(display_name, action, status, message):
     """Session logini saqlash"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO session_logs (display_name, action, status, message)
@@ -1358,6 +1451,54 @@ def log_session_action(display_name, action, status, message):
     ''', (display_name, action, status, message))
     conn.commit()
     conn.close()
+
+# ========== Eski session fayllarini yangi formatga o'tkazish ==========
+
+def migrate_old_sessions():
+    """Eski session fayllarini yangi formatga o'tkazish"""
+    if not os.path.exists(SESSIONS_DIR):
+        return
+    
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    cursor = conn.cursor()
+    
+    migrated_count = 0
+    for filename in os.listdir(SESSIONS_DIR):
+        if filename.endswith('.session') and '_' not in filename:
+            # Eski format: display_name.session
+            old_display_name = filename.replace('.session', '')
+            
+            # Bazadan shu display_name ga tegishli user_id larni topish
+            cursor.execute('SELECT user_id FROM accounts WHERE display_name = ?', (old_display_name,))
+            results = cursor.fetchall()
+            
+            if results:
+                for result in results:
+                    user_id = result[0]
+                    old_path = os.path.join(SESSIONS_DIR, filename)
+                    new_path = get_session_path(old_display_name, user_id)
+                    
+                    # Faylni ko'chirish
+                    try:
+                        # Agar yangi fayl allaqachon mavjud bo'lsa, o'tkazib yuborish
+                        if not os.path.exists(new_path):
+                            # Asl faylni o'qib, yangi faylga yozish
+                            with open(old_path, 'rb') as f:
+                                content = f.read()
+                            with open(new_path, 'wb') as f:
+                                f.write(content)
+                            
+                            logger.info(f"📁 Session ko'chirildi: {filename} -> {user_id}_{old_display_name}.session")
+                            migrated_count += 1
+                    except Exception as e:
+                        logger.error(f"Session ko'chirishda xato: {e}")
+    
+    conn.close()
+    
+    if migrated_count > 0:
+        logger.info(f"✅ {migrated_count} ta eski session fayli yangi formatga o'tkazildi")
+    
+    return migrated_count
 
 # ========== ADMIN KEYBOARDS ==========
 
@@ -1367,7 +1508,7 @@ def get_admin_keyboard():
         ["📋 Foydalanuvchilar", "⏳ So'rovlar"],
         ["➕ Ruxsat berish", "🗑️ Hisob o'chirish"],
         ["📊 Statistika", "⚙️ Sozlamalar"],
-        ["🔄 Session boshqarish", "🔄 Avtomatik yuborish"],
+        ["🔄 Session boshqarish", "🔄 Interval boshqaruvi"],  # ✅ YANGI
         ["⏸️ To'xtatish", "🔄 Yangilash"],
         ["📢 Xabar yuborish"],
         ["📌 Kanal ID o'rnatish (Ixtiyoriy)"]
@@ -1378,7 +1519,7 @@ def get_user_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Hisob qo'shish", "🧪 Session test"],
         ["📤 Xabar qo'shish", "🔗 Guruh qo'shish"],
-        ["👥 Guruhlarni ko'rish", "⚙️ Interval sozlash"],
+        ["👥 Guruhlarni ko'rish", "⚙️ Hisob intervali"],  # ✅ O'ZGARDI
         ["🎲 Random rejim", "▶️ Boshlash"],
         ["⏹️ To'xtatish", "📋 Hisoblar"],
         ["📝 Xabarlar", "🗑️ Xabarlarni tozalash"],
@@ -1466,9 +1607,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if has_active_subscription:
         sub_date = datetime.strptime(subscription_end, '%Y-%m-%d %H:%M:%S')
         
-        # Foydalanuvchi intervallarini olish
-        user_min_interval, user_max_interval = get_user_interval(user_id)
-        
         # Hisoblar sonini olish
         accounts_count = get_user_accounts_count(user_id)
         max_accounts = 5
@@ -1480,7 +1618,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📅 Qolgan kunlar: {days_left} kun\n"
             f"⏰ Tugash sanasi: {sub_date.strftime('%Y-%m-%d')}\n"
             f"📊 Hisoblar: {accounts_count}/{max_accounts} ta\n"
-            f"⏱️ Interval: {user_min_interval}-{user_max_interval} daqiqa\n"
             f"📦 Media saqlash: Arxiv kanalida\n\n"
             f"🤖 Bot funksiyalaridan foydalaning:",
             reply_markup=get_user_keyboard()
@@ -1561,7 +1698,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     # Arxiv kanalini tekshirish
-    storage_channel = get_storage_channel()
+    storage_channel = await get_storage_channel(context.bot)
     if storage_channel == 'not_set':
         await update.message.reply_text(
             "❌ **ARXIV KANALI SOZLANMAGAN!**\n\n"
@@ -1643,7 +1780,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 await loading_msg.delete()
                 await update.message.reply_text(
-                    f"❌ **XATOLIK!**\n\n{error or 'Media arxivlashda xatolik yuz berdi.'}",
+                    f"❌ **XATOLIK!**\n\nMedia arxivlashda xatolik yuz berdi.\n\nXato: {error}",
                     reply_markup=get_user_keyboard()
                 )
         except Exception as e:
@@ -1667,6 +1804,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """Admin text habarlari"""
     user_id = update.effective_user.id
+    global STORAGE_CHANNEL_USERNAME
     mode = context.user_data.get("mode")
     
     # Global o'zgaruvchilarni e'lon qilish
@@ -1775,7 +1913,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             accounts = get_user_accounts(uid)
             total_accounts += len(accounts)
             
-            conn = sqlite3.connect(DB_FILE)
+            conn = sqlite3.connect(DB_FILE, timeout=30)
             cursor = conn.cursor()
             cursor.execute('SELECT COUNT(*) FROM groups WHERE user_id = ?', (uid,))
             total_groups += cursor.fetchone()[0]
@@ -1855,7 +1993,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
         context.user_data["mode"] = "set_welcome"
     
-    elif text == "📌 Arxiv kanali" or text == "📌 Kanal ID o'rnatish (Ixtiyoriy)":
+    elif text == "📌 Arxiv kanali":
         current_channel = get_setting('storage_channel', STORAGE_CHANNEL_USERNAME)
         
         await update.message.reply_text(
@@ -1864,6 +2002,19 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "Yangi kanal username ni yuboring:\n"
             "(Misol: @my_storage_channel)\n\n"
             "Bekor qilish: /cancel"
+        )
+        context.user_data["mode"] = "set_storage_channel"
+    
+    elif text == "📌 Kanal ID o'rnatish (Ixtiyoriy)":
+        current_channel = get_setting('storage_channel', STORAGE_CHANNEL_USERNAME)
+        
+        await update.message.reply_text(
+            f"📌 **ARXIV KANALINI SOZLASH**\n\n"
+            f"📦 Hozirgi kanal: {current_channel}\n\n"
+            f"⌨️ Yangi kanal username ni yuboring:\n"
+            f"(Misol: @my_storage_channel)\n\n"
+            f"⚠️ Eslatma: Kanalga bot admin sifatida qo'shilgan bo'lishi kerak!\n\n"
+            f"Bekor qilish: /cancel"
         )
         context.user_data["mode"] = "set_storage_channel"
     
@@ -1892,6 +2043,9 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             # Sozlamani yangilash
             save_setting('storage_channel', new_channel)
             
+            # Global o'zgaruvchini yangilash
+            STORAGE_CHANNEL_USERNAME = new_channel
+            
             await update.message.reply_text(
                 f"✅ **Arxiv kanali yangilandi!**\n\n"
                 f"📦 Yangi kanal: {new_channel}\n\n"
@@ -1909,13 +2063,121 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             )
             context.user_data["mode"] = None
     
+    elif text == "🔄 Interval boshqaruvi":
+        users = get_all_users()
+        
+        keyboard = []
+        for uid in users[:20]:
+            accounts = get_user_accounts(uid)
+            for acc in accounts:
+                display_name = acc[0]
+                min_int, max_int = get_account_interval(uid, display_name)
+                keyboard.append([f"⏱️ {display_name} ({uid}) - {min_int}-{max_int} min"])
+        
+        keyboard.append(["🔙 Orqaga"])
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        await update.message.reply_text(
+            "🔄 **INTERVAL BOSHQARUVI**\n\n"
+            "Qaysi hisobning intervalini o'zgartirmoqchisiz?\n\n"
+            "Bekor qilish: /cancel",
+            reply_markup=reply_markup
+        )
+        context.user_data["mode"] = "admin_select_account_interval"
+    
+    elif text.startswith("⏱️ ") and mode == "admin_select_account_interval":
+        # Format: "⏱️ account1 (123456789) - 20-25 min"
+        parts = text[2:].split(" (")
+        if len(parts) == 2:
+            display_name = parts[0].strip()
+            rest = parts[1]
+            user_id_str = rest.split(")")[0].strip()
+            
+            try:
+                target_user_id = int(user_id_str)
+                context.user_data["admin_interval_account"] = display_name
+                context.user_data["admin_interval_user_id"] = target_user_id
+                
+                # Hozirgi intervalni olish
+                min_int, max_int = get_account_interval(target_user_id, display_name)
+                
+                await update.message.reply_text(
+                    f"🔄 **ADMIN INTERVAL SOZLASH**\n\n"
+                    f"👤 Foydalanuvchi ID: {target_user_id}\n"
+                    f"📱 Hisob: {display_name}\n"
+                    f"⏰ Hozirgi interval: {min_int}-{max_int} daqiqa\n\n"
+                    "Yangi intervalni yuboring:\n"
+                    "Format: min max\n"
+                    "Misol: 10 20 (10-20 daqiqa)\n\n"
+                    "Bekor qilish: /cancel"
+                )
+                context.user_data["mode"] = "admin_set_account_interval"
+                
+            except ValueError:
+                await update.message.reply_text("❌ Noto'g'ri format!")
+    
+    elif mode == "admin_set_account_interval":
+        try:
+            parts = text.split()
+            if len(parts) != 2:
+                await update.message.reply_text("❌ Format: min max\nMisol: 10 20")
+                return
+            
+            min_val = int(parts[0])
+            max_val = int(parts[1])
+            
+            if min_val < 1 or max_val < 1:
+                await update.message.reply_text("❌ Interval kamida 1 daqiqa bo'lishi kerak!")
+                return
+            
+            if min_val > 1440 or max_val > 1440:
+                await update.message.reply_text("❌ Interval 1440 daqiqadan (24 soat) oshmasligi kerak!")
+                return
+            
+            if min_val >= max_val:
+                await update.message.reply_text("❌ Min interval max dan kichik bo'lishi kerak!")
+                return
+            
+            display_name = context.user_data.get("admin_interval_account")
+            target_user_id = context.user_data.get("admin_interval_user_id")
+            
+            # Intervalni saqlash
+            set_account_interval(target_user_id, display_name, min_val, max_val)
+            
+            # Foydalanuvchiga xabar yuborish
+            try:
+                await context.bot.send_message(
+                    target_user_id,
+                    f"⚙️ **INTERVAL YANGILANDI**\n\n"
+                    f"📱 Hisob: {display_name}\n"
+                    f"📅 Yangi interval: {min_val}-{max_val} daqiqa\n\n"
+                    f"Admin tomonidan interval o'zgartirildi."
+                )
+            except Exception as e:
+                logger.error(f"Foydalanuvchiga xabar yuborishda xato: {e}")
+            
+            await update.message.reply_text(
+                f"✅ **Interval yangilandi!**\n\n"
+                f"👤 Foydalanuvchi ID: {target_user_id}\n"
+                f"📱 Hisob: {display_name}\n"
+                f"📅 Yangi interval: {min_val}-{max_val} daqiqa",
+                reply_markup=get_admin_keyboard()
+            )
+            context.user_data["mode"] = None
+            
+        except ValueError:
+            await update.message.reply_text("❌ Noto'g'ri format! Faqat raqam kiriting.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Xatolik: {str(e)}", reply_markup=get_admin_keyboard())
+            context.user_data["mode"] = None
+    
     elif text == "🔙 Orqaga":
         await update.message.reply_text("👑 **Admin Paneli**", reply_markup=get_admin_keyboard())
         context.user_data.clear()
     
     elif text == "🔄 Session boshqarish":
         # Pending sessions ro'yxati
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30)
         cursor = conn.cursor()
         cursor.execute('SELECT display_name, phone, user_id FROM pending_sessions')
         pending_sessions = cursor.fetchall()
@@ -1927,7 +2189,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 display_name, phone, uid = session
                 msg += f"📱 {display_name} (User: {uid})\n"
                 msg += f"   📞 +{phone}\n"
-                msg += f"   ⌨️ Kod kiritish: `/code {display_name} KOD`\n\n"
+                msg += f"   ⌨️ Kod kiritish: `/code {display_name} {uid} KOD`\n\n"
             
             await update.message.reply_text(msg)
         else:
@@ -1942,9 +2204,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             for acc in accounts:
                 display_name, phone, _, _, is_active, _, _ = acc
                 status = "✅" if is_active == 1 else "❌"
-                # Display name'ni oddiy ko'rinishda chiqaramiz
-                simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
-                keyboard.append([f"{status} {simple_name} ({uid})"])
+                keyboard.append([f"{status} {display_name} ({uid})"])
         
         keyboard.append(["🔙 Orqaga"])
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -1958,30 +2218,15 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     
     elif text.startswith("✅ ") or text.startswith("❌ "):
         if mode == "select_session_account":
-            # Format: "✅ 1 (123456789)" yoki "❌ 1 (123456789)"
+            # Format: "✅ account1 (123456789)" yoki "❌ account1 (123456789)"
             status_char = text[0]
             parts = text[2:].split(" (")
             if len(parts) == 2:
-                simple_name = parts[0].strip()
+                display_name = parts[0].strip()
                 user_id_str = parts[1].replace(")", "").strip()
                 
                 try:
                     target_user_id = int(user_id_str)
-                    
-                    # Asl display name'ni topish
-                    accounts = get_user_accounts(target_user_id)
-                    display_name = None
-                    for acc in accounts:
-                        acc_name = acc[0]
-                        # Simple name bilan solishtiramiz
-                        if simple_name == acc_name.split('_')[-1] if '_' in acc_name else acc_name:
-                            display_name = acc_name
-                            break
-                    
-                    if not display_name:
-                        await update.message.reply_text("❌ Hisob topilmadi!")
-                        return
-                    
                     context.user_data["session_account"] = display_name
                     context.user_data["session_user_id"] = target_user_id
                     
@@ -1995,7 +2240,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             is_active = acc[4]
                             break
                     
-                    session_exists_flag = session_exists(display_name)
+                    session_exists_flag = session_exists(display_name, target_user_id)
                     
                     keyboard = []
                     if not session_exists_flag:
@@ -2053,7 +2298,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 f"📱 Hisob: {display_name}\n"
                 f"📞 Telefon: +{phone}\n\n"
                 f"Admin endi kodni kiritishi kerak:\n"
-                f"`/code {display_name} KOD`"
+                f"`/code {display_name} {target_user_id} KOD`"
             )
         else:
             await update.message.reply_text(
@@ -2063,10 +2308,11 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     
     elif text == "🧪 Sessionni test qilish" and mode == "manage_session":
         display_name = context.user_data.get("session_account")
+        target_user_id = context.user_data.get("session_user_id")
         
         await update.message.reply_text(f"⏳ Session test qilinmoqda: {display_name}...")
         
-        success, message = await test_session(display_name)
+        success, message = await test_session(display_name, target_user_id)
         
         await update.message.reply_text(f"📝 **TEST NATIJASI**\n\n{message}")
     
@@ -2084,13 +2330,14 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     
     elif mode == "send_test_message":
         display_name = context.user_data.get("session_account")
+        target_user_id = context.user_data.get("session_user_id")
         group_identifier = text.strip()
         
         test_message = "🤖 Test xabar - Bu bot tomonidan yuborilgan test xabari!"
         
         await update.message.reply_text(f"⏳ Test xabar yuborilmoqda...\nHisob: {display_name}\nGuruh: {group_identifier}")
         
-        success, result_message = await send_message_to_group(display_name, group_identifier, test_message)
+        success, result_message = await send_message_to_group(display_name, group_identifier, test_message, target_user_id)
         
         await update.message.reply_text(f"📝 **TEST XABAR NATIJASI**\n\n{result_message}")
         
@@ -2172,9 +2419,9 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         
         await update.message.reply_text(
             "✅ **Avtomatik yuborish yoqildi!**\n\n"
-            f"⏰ Interval: {min_interval}-{max_interval} daqiqa\n"
             f"🎲 Random: {'✅ Yoqilgan' if random_messages else '❌ Oʻchirilgan'}\n\n"
-            f"Barcha faol hisoblardagi faol guruhlarga xabar yuboriladi."
+            f"Barcha faol hisoblardagi faol guruhlarga xabar yuboriladi.\n"
+            f"Har bir hisob o'z intervalida ishlaydi."
         )
     
     elif text == "⏸️ To'xtatish":
@@ -2306,15 +2553,21 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         for acc in accounts:
             display_name, phone, _, _, is_active, _, _ = acc
             
-            # Session faylini tekshirish
-            session_exists_flag = session_exists(display_name)
+            # Session test qilish
+            success, test_result = await test_session(display_name, user_id)
             
-            # Simple name chiqaramiz
-            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
+            msg += f"📱 **{display_name}** (+{phone})\n"
+            msg += f"   🔧 Status: {'✅ Faol' if is_active == 1 else '❌ Nofaol'}\n"
+            msg += f"   📁 Session: {'✅ Mavjud' if success else '❌ Yoʻq'}\n"
             
-            msg += f"📱 **{simple_name}** (+{phone})\n"
-            msg += f"   📁 Session fayli: {'✅ Mavjud' if session_exists_flag else '❌ Yoʻq'}\n"
-            msg += f"   🔧 Status: {'✅ Faol' if is_active == 1 else '❌ Nofaol'}\n\n"
+            if success and "User:" in test_result:
+                # Faqat muhim qismni ko'rsatish
+                lines = test_result.split('\n')
+                for line in lines:
+                    if "User:" in line or "Phone:" in line or "Username:" in line:
+                        msg += f"   {line}\n"
+            
+            msg += "\n"
         
         await update.message.reply_text(msg, reply_markup=get_user_keyboard())
     
@@ -2346,9 +2599,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         for acc in accounts:
             display_name = acc[0]
             phone = acc[1]
-            # Simple name chiqaramiz
-            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
-            keyboard.append([f"📱 {simple_name} (+{phone})"])
+            keyboard.append([f"📱 {display_name} (+{phone})"])
         
         keyboard.append(["🔙 Orqaga"])
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -2372,13 +2623,12 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         for acc in accounts:
             display_name = acc[0]
             phone = acc[1]
-            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
             groups = get_user_groups(user_id, display_name)
             
             active_groups = sum(1 for g in groups if g[4] == 1)
             total_groups = len(groups)
             
-            msg += f"📱 **{simple_name}** (+{phone})\n"
+            msg += f"📱 **{display_name}** (+{phone})\n"
             msg += f"   📊 Guruhlar: {active_groups}/{total_groups} ta\n\n"
         
         keyboard = [[InlineKeyboardButton("⚙️ Guruhlarni boshqarish", callback_data="manage_groups")]]
@@ -2389,19 +2639,119 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         except:
             await update.message.reply_text(msg, reply_markup=reply_markup)
     
-    elif text == "⚙️ Interval sozlash":
-        # Foydalanuvchi intervalini olish
-        user_min_interval, user_max_interval = get_user_interval(user_id)
+    elif text == "⚙️ Hisob intervali":
+        accounts = get_user_accounts(user_id)
+        if not accounts:
+            await update.message.reply_text("❌ Hech qanday hisob yo'q!")
+            return
+        
+        keyboard = []
+        for acc in accounts:
+            display_name, phone, _, _, is_active, _, _ = acc
+            # Har bir hisobning intervalini olish
+            min_int, max_int = get_account_interval(user_id, display_name)
+            status = "✅" if is_active == 1 else "❌"
+            keyboard.append([f"{status} {display_name} ({min_int}-{max_int} min)"])
+        
+        keyboard.append(["🔙 Orqaga"])
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         await update.message.reply_text(
-            f"⚙️ **INTERVAL SOZLASH**\n\n"
-            f"Hozirgi interval: {user_min_interval}-{user_max_interval} daqiqa\n\n"
-            "Yangi intervalni yuboring:\n"
-            "Format: min max\n"
-            "Misol: 10 20 (10-20 daqiqa)\n\n"
-            "Bekor qilish: /cancel"
+            "⚙️ **HISOB INTERVALI SOZLASH**\n\n"
+            "Qaysi hisobning intervalini o'zgartirmoqchisiz?\n\n"
+            "Bekor qilish: /cancel",
+            reply_markup=reply_markup
         )
-        context.user_data["mode"] = "set_user_interval"
+        context.user_data["mode"] = "select_account_for_interval"
+    
+    elif text.startswith("✅ ") and mode == "select_account_for_interval":
+        # Format: "✅ account1 (20-25 min)"
+        parts = text[2:].split(" (")
+        if len(parts) == 2:
+            display_name = parts[0].strip()
+            context.user_data["interval_account"] = display_name
+            
+            # Hozirgi intervalni olish
+            min_int, max_int = get_account_interval(user_id, display_name)
+            
+            await update.message.reply_text(
+                f"⚙️ **INTERVAL SOZLASH**\n\n"
+                f"📱 Hisob: {display_name}\n"
+                f"⏰ Hozirgi interval: {min_int}-{max_int} daqiqa\n\n"
+                "Yangi intervalni yuboring:\n"
+                "Format: min max\n"
+                "Misol: 10 20 (10-20 daqiqa)\n"
+                "Minimal: 1 daqiqa\n"
+                "Maksimal: 1440 daqiqa (24 soat)\n\n"
+                "Bekor qilish: /cancel"
+            )
+            context.user_data["mode"] = "set_account_interval"
+    
+    elif text.startswith("❌ ") and mode == "select_account_for_interval":
+        # Format: "❌ account1 (20-25 min)"
+        parts = text[2:].split(" (")
+        if len(parts) == 2:
+            display_name = parts[0].strip()
+            context.user_data["interval_account"] = display_name
+            
+            # Hozirgi intervalni olish
+            min_int, max_int = get_account_interval(user_id, display_name)
+            
+            await update.message.reply_text(
+                f"⚙️ **INTERVAL SOZLASH**\n\n"
+                f"📱 Hisob: {display_name} (❌ Nofaol)\n"
+                f"⏰ Hozirgi interval: {min_int}-{max_int} daqiqa\n\n"
+                "Yangi intervalni yuboring:\n"
+                "Format: min max\n"
+                "Misol: 10 20 (10-20 daqiqa)\n"
+                "Minimal: 1 daqiqa\n"
+                "Maksimal: 1440 daqiqa (24 soat)\n\n"
+                "Bekor qilish: /cancel"
+            )
+            context.user_data["mode"] = "set_account_interval"
+    
+    elif mode == "set_account_interval":
+        try:
+            parts = text.split()
+            if len(parts) != 2:
+                await update.message.reply_text("❌ Format: min max\nMisol: 10 20")
+                return
+            
+            min_val = int(parts[0])
+            max_val = int(parts[1])
+            
+            # Interval cheklovlari
+            if min_val < 1 or max_val < 1:
+                await update.message.reply_text("❌ Interval kamida 1 daqiqa bo'lishi kerak!")
+                return
+            
+            if min_val > 1440 or max_val > 1440:
+                await update.message.reply_text("❌ Interval 1440 daqiqadan (24 soat) oshmasligi kerak!")
+                return
+            
+            if min_val >= max_val:
+                await update.message.reply_text("❌ Min interval max dan kichik bo'lishi kerak!")
+                return
+            
+            display_name = context.user_data.get("interval_account")
+            
+            # Intervalni saqlash
+            set_account_interval(user_id, display_name, min_val, max_val)
+            
+            await update.message.reply_text(
+                f"✅ **Interval yangilandi!**\n\n"
+                f"📱 Hisob: {display_name}\n"
+                f"📅 Yangi interval: {min_val}-{max_val} daqiqa\n\n"
+                f"Endi bu hisob har {min_val}-{max_val} daqiqa oralig'ida xabar yuboradi.",
+                reply_markup=get_user_keyboard()
+            )
+            context.user_data["mode"] = None
+            
+        except ValueError:
+            await update.message.reply_text("❌ Noto'g'ri format! Faqat raqam kiriting.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Xatolik: {str(e)}", reply_markup=get_user_keyboard())
+            context.user_data["mode"] = None
     
     elif text == "🎲 Random rejim":
         # Foydalanuvchi uchun random rejim sozlash
@@ -2419,14 +2769,11 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         is_sending = True
         last_send_time = datetime.now().strftime("%H:%M:%S")
         
-        # Foydalanuvchi intervalini olish
-        user_min_interval, user_max_interval = get_user_interval(user_id)
-        
         await update.message.reply_text(
             "✅ **Avtomatik yuborish boshlandi!**\n\n"
-            f"⏰ Interval: {user_min_interval}-{user_max_interval} daqiqa\n"
             f"🎲 Random: {'✅ Yoqilgan' if context.user_data.get('random_messages', True) else '❌ Oʻchirilgan'}\n\n"
-            f"Barcha faol hisoblardagi faol guruhlarga xabar yuboriladi."
+            f"Barcha faol hisoblardagi faol guruhlarga xabar yuboriladi.\n"
+            f"Har bir hisob o'z intervalida ishlaydi."
         )
     
     elif text == "⏹️ To'xtatish":
@@ -2529,43 +2876,39 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         sub_date = datetime.strptime(subscription_end, '%Y-%m-%d %H:%M:%S')
         days_left = (sub_date - datetime.now()).days
         
-        # Foydalanuvchi intervalini olish
-        user_min_interval, user_max_interval = get_user_interval(user_id)
+        # Arxiv kanali ma'lumotini olish
+        storage_channel = get_setting('storage_channel', STORAGE_CHANNEL_USERNAME)
+        storage_channel_link = f"https://t.me/{storage_channel[1:]}" if storage_channel.startswith('@') else storage_channel
         
         msg = "📊 **STATISTIKA**\n\n"
         msg += f"📱 Hisoblar: {len(accounts)}/5 ta\n"
         msg += f"👥 Faol guruhlar: {active_groups}/{total_groups} ta\n"
         msg += f"📝 Xabarlar: {total_messages} ta\n"
         msg += f"📅 Obuna: {days_left} kun qoldi\n"
-        msg += f"⏱️ Interval: {user_min_interval}-{user_max_interval} daqiqa\n"
-        msg += f"📦 Media saqlash: Arxiv kanalida\n"
+        msg += f"📦 Arxiv kanali: [{storage_channel}]({storage_channel_link})\n"
         msg += f"🔄 Yuborish: {'✅ Yoqilgan' if is_sending else '❌ Oʻchirilgan'}"
         
         try:
-            await update.message.reply_text(msg, parse_mode='Markdown')
+            await update.message.reply_text(msg, parse_mode='Markdown', disable_web_page_preview=True)
         except:
-            await update.message.reply_text(msg)
+            # Agar markdown xatolik bersa oddiy text formatida
+            msg_simple = "📊 STATISTIKA\n\n"
+            msg_simple += f"📱 Hisoblar: {len(accounts)}/5 ta\n"
+            msg_simple += f"👥 Faol guruhlar: {active_groups}/{total_groups} ta\n"
+            msg_simple += f"📝 Xabarlar: {total_messages} ta\n"
+            msg_simple += f"📅 Obuna: {days_left} kun qoldi\n"
+            msg_simple += f"📦 Arxiv kanali: {storage_channel}\n"
+            msg_simple += f"🔄 Yuborish: {'✅ Yoqilgan' if is_sending else '❌ Oʻchirilgan'}"
+            await update.message.reply_text(msg_simple)
+    
+    # ... (qolgan kodlar)
     
     elif text.startswith("📱 ") and mode == "select_account":
-        simple_name = text[2:].split(" ")[0]
-        
-        # Asl display name'ni topish
-        accounts = get_user_accounts(user_id)
-        display_name = None
-        for acc in accounts:
-            acc_name = acc[0]
-            if simple_name == acc_name.split('_')[-1] if '_' in acc_name else acc_name:
-                display_name = acc_name
-                break
-        
-        if not display_name:
-            await update.message.reply_text("❌ Hisob topilmadi!")
-            return
-        
+        display_name = text[2:].split(" ")[0]
         context.user_data["selected_account"] = display_name
         
         await update.message.reply_text(
-            f"✅ **{simple_name} tanlandi!**\n\n"
+            f"✅ **{display_name} tanlandi!**\n\n"
             "Endi guruhlarni yuboring:\n"
             "• Har bir guruh alohida qatorda\n"
             "• @guruh_nomi yoki https://t.me/guruh_nomi\n\n"
@@ -2615,18 +2958,15 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             await update.message.reply_text("❌ Hisob limitiga yetdingiz! Maksimum 5 ta hisob.")
             return
         
-        display_name = f"account_{user_id}_{account_number}"
+        display_name = f"account{account_number}"
         
         # Hisobni bazaga qo'shish
         result = add_user_account(user_id, phone=phone, country_code="998", username="", display_name=display_name)
         
         if result:
-            # Simple name (faqat oxirgi raqam)
-            simple_name = str(account_number)
-            
             await update.message.reply_text(
                 f"✅ **HISOB QO'SHILDI!**\n\n"
-                f"📱 Hisob: {simple_name}\n"
+                f"📱 Hisob: {display_name}\n"
                 f"📞 Telefon: +{phone}\n\n"
                 f"⏳ Kod yuborilmoqda..."
             )
@@ -2636,20 +2976,33 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             
             if success and message.startswith("ENTER_CODE:"):
                 # Foydalanuvchidan kodni so'rash
-                pending_display_name = message.replace("ENTER_CODE:", "")
-                context.user_data["mode"] = "enter_code"
-                context.user_data["pending_account"] = pending_display_name
-                
-                await update.message.reply_text(
-                    f"📱 **KOD YUBORILDI!**\n\n"
-                    f"📞 +{phone} raqamiga SMS kod yuborildi.\n\n"
-                    f"⌨️ Iltimos, kelgan kodni kiriting:\n"
-                    f"(Masalan: 12345)\n\n"
-                    f"Bekor qilish: /cancel",
-                    reply_markup=ReplyKeyboardRemove()
-                )
+                pending_data = message.replace("ENTER_CODE:", "")
+                parts = pending_data.split(":")
+                if len(parts) == 2:
+                    pending_display_name = parts[0]
+                    pending_user_id = parts[1]
+                    
+                    # Tekshirish
+                    if pending_display_name == display_name and int(pending_user_id) == user_id:
+                        context.user_data["mode"] = "enter_code"
+                        context.user_data["pending_account"] = pending_display_name
+                        
+                        await update.message.reply_text(
+                            f"📱 **KOD YUBORILDI!**\n\n"
+                            f"📞 +{phone} raqamiga SMS kod yuborildi.\n\n"
+                            f"⌨️ Iltimos, kelgan kodni kiriting:\n"
+                            f"(Masalan: 12345)\n\n"
+                            f"Bekor qilish: /cancel",
+                            reply_markup=ReplyKeyboardRemove()
+                        )
+                    else:
+                        await update.message.reply_text(
+                            "❌ Xatolik: Display name mos kelmadi!",
+                            reply_markup=get_user_keyboard()
+                        )
+                        context.user_data.clear()
             elif success:
-                await update.message_reply_text(
+                await update.message.reply_text(
                     f"✅ **Hisob faollashtirildi!**\n\n{message}",
                     reply_markup=get_user_keyboard()
                 )
@@ -2714,40 +3067,6 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             reply_markup=reply_markup
         )
     
-    elif mode == "set_user_interval":
-        try:
-            parts = text.split()
-            if len(parts) != 2:
-                await update.message.reply_text("❌ Format: min max\nMisol: 10 20")
-                return
-            
-            min_val = int(parts[0])
-            max_val = int(parts[1])
-            
-            if min_val <= 0 or max_val <= 0:
-                await update.message.reply_text("❌ Interval 0 dan katta bo'lishi kerak!")
-                return
-            
-            if min_val >= max_val:
-                await update.message.reply_text("❌ Min interval max dan kichik bo'lishi kerak!")
-                return
-            
-            # Intervalni saqlash
-            save_user_interval(user_id, min_val, max_val)
-            
-            await update.message.reply_text(
-                f"✅ **Interval yangilandi!**\n\n"
-                f"📅 Yangi interval: {min_val}-{max_val} daqiqa",
-                reply_markup=get_user_keyboard()
-            )
-            context.user_data["mode"] = None
-            
-        except ValueError:
-            await update.message.reply_text("❌ Noto'g'ri format! Faqat raqam kiriting.")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Xatolik: {str(e)}", reply_markup=get_user_keyboard())
-            context.user_data["mode"] = None
-    
     elif mode == "enter_code":
         # Foydalanuvchi kodni kiritmoqda
         code = text.strip()
@@ -2769,12 +3088,12 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         
         await update.message.reply_text(f"⏳ Kod tekshirilmoqda: {pending_account}...")
         
-        success, message = await enter_code(pending_account, code)
+        success, message = await enter_code(pending_account, user_id, code)
         
         if success:
             await update.message.reply_text(
                 f"✅ **HISOB FAOLLASHTIRILDI!**\n\n"
-                f"📱 Hisob: {pending_account.split('_')[-1] if '_' in pending_account else pending_account}\n"
+                f"📱 Hisob: {pending_account}\n"
                 f"✅ Status: Faol\n\n"
                 f"Endi guruh qo'shishingiz va xabar yuborishingiz mumkin!",
                 reply_markup=get_user_keyboard()
@@ -2787,7 +3106,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             
             await update.message.reply_text(
                 f"🔐 **2FA PAROL KERAK!**\n\n"
-                f"📱 Hisob: {pending_account.split('_')[-1] if '_' in pending_account else pending_account}\n\n"
+                f"📱 Hisob: {pending_account}\n\n"
                 f"⌨️ Iltimos, 2FA parolingizni kiriting:\n"
                 f"(Agar paroldan keyin kod ham kerak bo'lsa: parol.kod)\n\n"
                 f"Bekor qilish: /cancel",
@@ -2824,12 +3143,12 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         
         await update.message.reply_text(f"⏳ Parol tekshirilmoqda: {pending_account}...")
         
-        success, message = await enter_password(pending_account, password)
+        success, message = await enter_password(pending_account, user_id, password)
         
         if success:
             await update.message.reply_text(
                 f"✅ **HISOB TO'LIQ FAOLLASHTIRILDI!**\n\n"
-                f"📱 Hisob: {pending_account.split('_')[-1] if '_' in pending_account else pending_account}\n"
+                f"📱 Hisob: {pending_account}\n"
                 f"🔐 2FA parol tasdiqlandi\n"
                 f"✅ Status: To'liq faol\n\n"
                 f"Endi guruh qo'shishingiz va xabar yuborishingiz mumkin!",
@@ -3026,6 +3345,11 @@ async def process_set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def process_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
     """/add command or called from text handler"""
+    # Admin-only check
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Bu buyruq faqat admin uchun!")
+        return
+
     try:
         raw_text = text if text is not None else (update.message.text if update.message and update.message.text else "")
         target_user_id, days = parse_id_days(raw_text)
@@ -3084,6 +3408,11 @@ async def process_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def process_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
     """/remove or 'remove 123'"""
+    # Admin-only check
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Bu buyruq faqat admin uchun!")
+        return
+
     try:
         raw_text = text if text is not None else (update.message.text if update.message and update.message.text else "")
         target_user_id = parse_single_id(raw_text)
@@ -3111,6 +3440,11 @@ async def process_remove_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def process_reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
     """/reject or 'reject 1'"""
+    # Admin-only check
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Bu buyruq faqat admin uchun!")
+        return
+
     try:
         raw_text = text if text is not None else (update.message.text if update.message and update.message.text else "")
         request_id = parse_single_id(raw_text)
@@ -3163,16 +3497,22 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Bu buyruq faqat admin uchun!")
         return
     
-    if not context.args or len(context.args) != 2:
-        await update.message.reply_text("❌ Format: /code DISPLAY_NAME KOD\nMisol: /code account_123456789_1 12345")
+    if not context.args or len(context.args) != 3:
+        await update.message.reply_text("❌ Format: /code DISPLAY_NAME USER_ID KOD\nMisol: /code account1 123456789 12345")
         return
     
     display_name = context.args[0]
-    code = context.args[1]
+    try:
+        target_user_id = int(context.args[1])
+    except:
+        await update.message.reply_text("❌ Noto'g'ri USER_ID format!")
+        return
     
-    await update.message.reply_text(f"⏳ Kod kiritilmoqda: {display_name}...")
+    code = context.args[2]
     
-    success, message = await enter_code(display_name, code)
+    await update.message.reply_text(f"⏳ Kod kiritilmoqda: {display_name} (User: {target_user_id})...")
+    
+    success, message = await enter_code(display_name, target_user_id, code)
     
     log_session_action(display_name, "enter_code", "success" if success else "failed", message)
     
@@ -3180,25 +3520,16 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if success:
         # Foydalanuvchiga xabar yuborish
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM accounts WHERE display_name = ?', (display_name,))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            target_user_id = result[0]
-            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
-            try:
-                await context.bot.send_message(
-                    target_user_id,
-                    f"🎉 **HISOBINGIZ FAOL QILINDI!**\n\n"
-                    f"📱 Hisob: {simple_name}\n"
-                    f"✅ Status: Faol\n\n"
-                    f"Endi guruh qo'shishingiz va xabar yuborishingiz mumkin!"
-                )
-            except Exception as e:
-                logger.error(f"Foydalanuvchiga xabar yuborishda xato: {e}")
+        try:
+            await context.bot.send_message(
+                target_user_id,
+                f"🎉 **HISOBINGIZ FAOL QILINDI!**\n\n"
+                f"📱 Hisob: {display_name}\n"
+                f"✅ Status: Faol\n\n"
+                f"Endi guruh qo'shishingiz va xabar yuborishingiz mumkin!"
+            )
+        except Exception as e:
+            logger.error(f"Foydalanuvchiga xabar yuborishda xato: {e}")
 
 async def password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """2FA parolini kiritish"""
@@ -3208,16 +3539,22 @@ async def password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Bu buyruq faqat admin uchun!")
         return
     
-    if not context.args or len(context.args) != 2:
-        await update.message.reply_text("❌ Format: /password DISPLAY_NAME PAROL\nMisol: /password account_123456789_1 mypassword")
+    if not context.args or len(context.args) != 3:
+        await update.message.reply_text("❌ Format: /password DISPLAY_NAME USER_ID PAROL\nMisol: /password account1 123456789 mypassword")
         return
     
     display_name = context.args[0]
-    password = context.args[1]
+    try:
+        target_user_id = int(context.args[1])
+    except:
+        await update.message.reply_text("❌ Noto'g'ri USER_ID format!")
+        return
     
-    await update.message.reply_text(f"⏳ Parol kiritilmoqda: {display_name}...")
+    password = context.args[2]
     
-    success, message = await enter_password(display_name, password)
+    await update.message.reply_text(f"⏳ Parol kiritilmoqda: {display_name} (User: {target_user_id})...")
+    
+    success, message = await enter_password(display_name, target_user_id, password)
     
     log_session_action(display_name, "enter_password", "success" if success else "failed", message)
     
@@ -3225,25 +3562,16 @@ async def password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if success:
         # Foydalanuvchiga xabar yuborish
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM accounts WHERE display_name = ?', (display_name,))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            target_user_id = result[0]
-            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
-            try:
-                await context.bot.send_message(
-                    target_user_id,
-                    f"🔐 **2FA PAROL TASDIQLANDI!**\n\n"
-                    f"📱 Hisob: {simple_name}\n"
-                    f"✅ Status: To'liq faol\n\n"
-                    f"Hisobingiz endi to'liq faol holatda!"
-                )
-            except Exception as e:
-                logger.error(f"Foydalanuvchiga xabar yuborishda xato: {e}")
+        try:
+            await context.bot.send_message(
+                target_user_id,
+                f"🔐 **2FA PAROL TASDIQLANDI!**\n\n"
+                f"📱 Hisob: {display_name}\n"
+                f"✅ Status: To'liq faol\n\n"
+                f"Hisobingiz endi to'liq faol holatda!"
+            )
+        except Exception as e:
+            logger.error(f"Foydalanuvchiga xabar yuborishda xato: {e}")
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sessionni test qilish"""
@@ -3253,15 +3581,20 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Bu buyruq faqat admin uchun!")
         return
     
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("❌ Format: /test DISPLAY_NAME\nMisol: /test account_123456789_1")
+    if not context.args or len(context.args) != 2:
+        await update.message.reply_text("❌ Format: /test DISPLAY_NAME USER_ID\nMisol: /test account1 123456789")
         return
     
     display_name = context.args[0]
+    try:
+        target_user_id = int(context.args[1])
+    except:
+        await update.message.reply_text("❌ Noto'g'ri USER_ID format!")
+        return
     
-    await update.message.reply_text(f"⏳ Session test qilinmoqda: {display_name}...")
+    await update.message.reply_text(f"⏳ Session test qilinmoqda: {display_name} (User: {target_user_id})...")
     
-    success, message = await test_session(display_name)
+    success, message = await test_session(display_name, target_user_id)
     
     log_session_action(display_name, "test_session", "success" if success else "failed", message)
     
@@ -3287,7 +3620,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for acc in accounts:
             display_name = acc[0]
             is_account_active = acc[4]  # is_active field
-            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
             groups = get_user_groups(user_id, display_name)
             
             if groups:
@@ -3298,7 +3630,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 account_status = "✅" if is_account_active == 1 else "❌"
                 keyboard.append([InlineKeyboardButton(
-                    f"{account_status} {simple_name} ({active_groups} faol / {len(groups)} jami)", 
+                    f"{account_status} {display_name} ({active_groups} faol / {len(groups)} jami)", 
                     callback_data=f"account_{display_name}"
                 )])
         
@@ -3320,8 +3652,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         groups = get_user_groups(user_id, display_name)
         
         if not groups:
-            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
-            await query.edit_message_text(f"❌ {simple_name} hisobida guruh yo'q!")
+            await query.edit_message_text(f"❌ {display_name} hisobida guruh yo'q!")
             return
         
         # Statistika
@@ -3344,7 +3675,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             keyboard.append([InlineKeyboardButton(text, callback_data=f"group_{group_db_id}")])
         
-        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         keyboard.append([
             InlineKeyboardButton("✅ Hammasini yoqish", callback_data=f"enable_all_{display_name}"),
             InlineKeyboardButton("❌ Hammasini o'chirish", callback_data=f"disable_all_{display_name}")
@@ -3354,7 +3684,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            f"⚙️ **{simple_name} - GURUHLAR**\n\n"
+            f"⚙️ **{display_name} - GURUHLAR**\n\n"
             f"📊 Statistika: {active_groups} faol / {inactive_groups} nofaol / {len(groups)} jami\n\n"
             f"✅ - faol (xabar yuboriladi)\n"
             f"❌ - nofaol (xabar yuborilmaydi)\n\n"
@@ -3387,7 +3717,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(
             f"📢 **GURUH MA'LUMOTLARI**\n\n"
-            f"📱 Hisob: {account_name.split('_')[-1] if '_' in account_name else account_name}\n"
+            f"📱 Hisob: {account_name}\n"
             f"📢 Guruh: {group_title}{username_text}\n"
             f"🆔 ID: {tg_group_id}\n"
             f"🔧 Status: {status}\n\n"
@@ -3405,13 +3735,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         account_name = group[2]
         group_title = group[4]
-        simple_name = account_name.split('_')[-1] if '_' in account_name else account_name
         
         update_group_active_status([group_id], 1)
         
         await query.edit_message_text(
             f"✅ **GURUH FAOLLASHTIRILDI!**\n\n"
-            f"📱 Hisob: {simple_name}\n"
+            f"📱 Hisob: {account_name}\n"
             f"📢 Guruh: {group_title}\n"
             f"🔧 Status: ✅ Faol"
         )
@@ -3431,13 +3760,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         account_name = group[2]
         group_title = group[4]
-        simple_name = account_name.split('_')[-1] if '_' in account_name else account_name
         
         update_group_active_status([group_id], 0)
         
         await query.edit_message_text(
             f"❌ **GURUH NOFAOLLASHTIRILDI!**\n\n"
-            f"📱 Hisob: {simple_name}\n"
+            f"📱 Hisob: {account_name}\n"
             f"📢 Guruh: {group_title}\n"
             f"🔧 Status: ❌ Nofaol"
         )
@@ -3457,7 +3785,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         account_name = group[2]
         group_title = group[4]
-        simple_name = account_name.split('_')[-1] if '_' in account_name else account_name
         
         # Tasdiqlash tugmalari
         keyboard = [
@@ -3469,7 +3796,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"⚠️ **TASDIQLASH**\n\n"
             f"📢 **{group_title}** guruhini o'chirmoqchimisiz?\n\n"
-            f"📱 Hisob: {simple_name}\n\n"
+            f"📱 Hisob: {account_name}\n\n"
             f"Bu amalni bekor qilib bo'lmaydi!",
             reply_markup=reply_markup
         )
@@ -3484,7 +3811,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         account_name = group[2]
         group_title = group[4]
-        simple_name = account_name.split('_')[-1] if '_' in account_name else account_name
         
         # Guruhni o'chirish
         success = delete_group_by_id(group_id)
@@ -3507,7 +3833,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("enable_all_"):
         display_name = data.replace("enable_all_", "")
-        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         
         groups = get_user_groups(user_id, display_name)
         group_ids = [g[0] for g in groups]
@@ -3515,11 +3840,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if group_ids:
             update_group_active_status(group_ids, 1)
         
-        await query.edit_message_text(f"✅ **{simple_name}**\n\nBarcha guruhlar faollashtirildi!\nJami: {len(group_ids)} ta guruh")
+        await query.edit_message_text(f"✅ **{display_name}**\n\nBarcha guruhlar faollashtirildi!\nJami: {len(group_ids)} ta guruh")
     
     elif data.startswith("disable_all_"):
         display_name = data.replace("disable_all_", "")
-        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         
         groups = get_user_groups(user_id, display_name)
         group_ids = [g[0] for g in groups]
@@ -3527,7 +3851,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if group_ids:
             update_group_active_status(group_ids, 0)
         
-        await query.edit_message_text(f"✅ **{simple_name}**\n\nBarcha guruhlar o'chirildi!\nJami: {len(group_ids)} ta guruh")
+        await query.edit_message_text(f"✅ **{display_name}**\n\nBarcha guruhlar o'chirildi!\nJami: {len(group_ids)} ta guruh")
     
     elif data == "finish_groups":
         await query.edit_message_text("✅ **Guruhlar muvaffaqiyatli qo'shildi!**\n\nEndi asosiy menyudan boshqa funksiyalardan foydalanishingiz mumkin.")
@@ -3562,9 +3886,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             display_name, phone, country_code, username, is_active, is_premium, subscription_end = acc
             
             status = "✅ Faol" if is_active == 1 else "❌ Nofaol"
-            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
             
-            msg += f"{i}. **{simple_name}**\n"
+            msg += f"{i}. **{display_name}**\n"
             msg += f"   📞: +{phone}\n"
             msg += f"   👤: @{username or 'Yoq'}\n"
             msg += f"   📊: {status}\n\n"
@@ -3584,7 +3907,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("👁 Hisoblarni ko'rish", callback_data="view_accounts")],
             [InlineKeyboardButton("🗑️ Hisobni o'chirish", callback_data="delete_account_menu")],
-            [InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_main")],
+            [InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_main")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -3606,8 +3929,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for acc in accounts:
             display_name, phone, _, _, is_active, _, _ = acc
             status = "✅" if is_active == 1 else "❌"
-            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
-            keyboard.append([InlineKeyboardButton(f"{status} {simple_name} (+{phone})", callback_data=f"confirm_delete_{display_name}")])
+            keyboard.append([InlineKeyboardButton(f"{status} {display_name} (+{phone})", callback_data=f"confirm_delete_{display_name}")])
         
         keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_accounts_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3622,7 +3944,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("confirm_delete_"):
         # O'chirishni tasdiqlash
         display_name = data.replace("confirm_delete_", "")
-        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         
         keyboard = [
             [InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"do_delete_{display_name}")],
@@ -3632,7 +3953,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(
             f"⚠️ **TASDIQLASH**\n\n"
-            f"📱 **{simple_name}** hisobini o'chirmoqchimisiz?\n\n"
+            f"📱 **{display_name}** hisobini o'chirmoqchimisiz?\n\n"
             f"Bu amalni bekor qilib bo'lmaydi!\n"
             f"Session fayli va barcha guruhlar ham o'chiriladi.",
             reply_markup=reply_markup
@@ -3641,20 +3962,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("do_delete_"):
         # Hisobni o'chirish
         display_name = data.replace("do_delete_", "")
-        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         
         success = delete_user_account(user_id, display_name)
         
         if success:
             await query.edit_message_text(
                 f"✅ **HISOB O'CHIRILDI!**\n\n"
-                f"📱 **{simple_name}** muvaffaqiyatli o'chirildi.\n"
+                f"📱 **{display_name}** muvaffaqiyatli o'chirildi.\n"
                 f"Session fayli va barcha guruhlar tozalandi."
             )
         else:
             await query.edit_message_text(
                 f"❌ **XATOLIK!**\n\n"
-                f"📱 **{simple_name}** hisobini o'chirishda xatolik yuz berdi."
+                f"📱 **{display_name}** hisobini o'chirishda xatolik yuz berdi."
             )
         
         await context.bot.send_message(chat_id=user_id, text="🤖 **Asosiy menyu**", reply_markup=get_user_keyboard())
@@ -3682,105 +4002,148 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== YANGILANGAN AUTO SEND LOOP ==========
 
 async def auto_send_loop():
-    """Avtomatik xabar yuborish loopi"""
+    """Avtomatik xabar yuborish loopi (YANGI VERSIYA)"""
     global is_sending, last_send_time
     
-    print("🔄 Avtomatik yuborish loopi ishga tushdi...")
+    print("🔄 Avtomatik yuborish loopi ishga tushdi (YANGI VERSIYA)...")
     
     # Session papkasini yaratish
     init_sessions_dir()
     
+    # Eski session fayllarini yangi formatga o'tkazish
+    migrated_count = migrate_old_sessions()
+    if migrated_count > 0:
+        print(f"✅ {migrated_count} ta eski session fayli yangi formatga o'tkazildi")
+    
     while True:
         try:
-            if is_sending:
-                users = get_all_users()
-                total_sent = 0
-                total_failed = 0
+            if not is_sending:
+                await asyncio.sleep(30)
+                continue
+            
+            current_time = datetime.now()
+            print(f"⏰ Loop ishlayapti: {current_time.strftime('%H:%M:%S')}")
+            
+            users = get_all_users()
+            total_sent = 0
+            total_failed = 0
+            
+            for user_id in users:
+                # Obunani tekshirish
+                subscription_end, is_premium = get_user_subscription(user_id)
+                if not subscription_end:
+                    continue
                 
-                for user_id in users:
-                    subscription_end, is_premium = get_user_subscription(user_id)
+                try:
+                    sub_date = datetime.strptime(subscription_end, '%Y-%m-%d %H:%M:%S')
+                    if current_time > sub_date:
+                        continue
+                except:
+                    continue
+                
+                # Har bir hisob uchun alohida ishlash
+                accounts = get_user_accounts(user_id)
+                
+                for acc in accounts:
+                    display_name, phone, _, _, is_active, _, _ = acc
                     
-                    if not subscription_end:
+                    if is_active != 1:
                         continue
                     
-                    try:
-                        sub_date = datetime.strptime(subscription_end, '%Y-%m-%d %H:%M:%S')
-                        if datetime.now() > sub_date:
+                    # Hisob intervalini olish
+                    account_min, account_max = get_account_interval(user_id, display_name)
+                    
+                    # Hisobning oxirgi yuborish vaqtini olish
+                    last_sent = get_account_last_sent(user_id, display_name)
+                    
+                    # Agar hali yuborilmagan bo'lsa, darhol yuborish
+                    if not last_sent:
+                        # Birinchi yuborish
+                        pass
+                    else:
+                        # O'tgan vaqtni hisoblash (daqiqalarda)
+                        minutes_passed = (current_time - last_sent).total_seconds() / 60
+                        
+                        # Random interval tanlash
+                        required_interval = random.randint(account_min, account_max)
+                        
+                        # Agar interval o'tmagan bo'lsa, keyingi hisobga o'tish
+                        if minutes_passed < required_interval:
                             continue
-                    except:
+                    
+                    # Faol guruhlarni olish
+                    groups = get_user_groups(user_id, display_name)
+                    active_groups = [g for g in groups if g[4] == 1]
+                    
+                    if not active_groups:
                         continue
                     
-                    accounts = get_user_accounts(user_id)
+                    # Xabarlarni olish
+                    messages = get_user_messages(user_id)
+                    if not messages:
+                        continue
                     
-                    # Foydalanuvchi intervalini olish
-                    user_min_interval, user_max_interval = get_user_interval(user_id)
+                    # Random xabar tanlash
+                    msg_data = get_random_user_message(user_id)
+                    if not msg_data:
+                        continue
                     
-                    for acc in accounts:
-                        display_name, phone, _, _, is_active, _, _ = acc
+                    # Guruhlarni tasodifiy tartiblash
+                    random.shuffle(active_groups)
+                    
+                    # Har bir guruhga xabar yuborish
+                    sent_to_groups = 0
+                    for group in active_groups:
+                        group_id = group[1]
+                        group_title = group[2]
                         
-                        if is_active != 1:
-                            continue
+                        # Har bir xabar o'rtasida 3-8 soniya kutish
+                        await asyncio.sleep(random.uniform(3, 8))
                         
-                        groups = get_user_groups(user_id, display_name)
-                        active_groups = [g for g in groups if g[4] == 1]
-                        
-                        if not active_groups:
-                            continue
-                        
-                        messages = get_user_messages(user_id)
-                        
-                        if not messages:
-                            continue
-                        
-                        # Random xabar olish (dict formatda)
-                        msg_data = get_random_user_message(user_id)
-                        
-                        if not msg_data:
-                            continue
-                        
-                        # Har bir guruhga xabar yuborish
-                        for group in active_groups:
-                            group_id = group[1]
+                        try:
+                            success, result = await send_message_to_group(display_name, group_id, msg_data, user_id)
                             
-                            # Haqiqiy xabar yuborish (arxiv kanal orqali)
-                            success, result = await send_message_to_group(display_name, group_id, msg_data)
-                            
-                            # Log uchun xabar matni
-                            log_text = msg_data.get('text', '') or f"[{msg_data.get('message_type', 'unknown')}]"
+                            # Log uchun
+                            log_text = msg_data.get('text', '') or msg_data.get('caption', '') or f"[{msg_data.get('message_type', 'unknown')}]"
                             if len(log_text) > 50:
                                 log_text = log_text[:50] + "..."
                             
                             if success:
                                 total_sent += 1
-                                logger.info(f"✅ {display_name} -> {group[2]}: {log_text}")
+                                sent_to_groups += 1
+                                logger.info(f"✅ {user_id}_{display_name} -> {group_title}: {log_text}")
                             else:
                                 total_failed += 1
-                                logger.error(f"❌ {display_name} -> {group[2]}: {result}")
-                            
-                            # Har bir xabar o'rtasida 3-8 soniya kutish
-                            await asyncio.sleep(random.uniform(3, 8))
+                                logger.error(f"❌ {user_id}_{display_name} -> {group_title}: {result}")
+                                
+                        except Exception as e:
+                            total_failed += 1
+                            logger.error(f"❌ {user_id}_{display_name} -> {group_title}: {str(e)}")
+                            await asyncio.sleep(5)  # Xato bo'lsa biroz kutish
                     
-                    # Har bir foydalanuvchi uchun o'z intervalida kutish
-                    if total_sent > 0:
-                        user_delay = random.randint(user_min_interval * 60, user_max_interval * 60)
-                        logger.info(f"⏰ {user_id} uchun keyingi yuborishga {user_delay//60} daqiqa qoldi...")
-                        await asyncio.sleep(user_delay)
-                
-                if total_sent > 0 or total_failed > 0:
-                    last_send_time = datetime.now().strftime("%H:%M:%S")
-                    logger.info(f"📊 NATIJA: {total_sent} ta xabar yuborildi, {total_failed} ta xatolik")
-                else:
-                    logger.info("ℹ️ Hech qanday xabar yuborilmadi (aktiv guruhlar yo'q)")
+                    # Agar kamida bitta guruhga yuborilgan bo'lsa, vaqtni yangilash
+                    if sent_to_groups > 0:
+                        update_account_last_sent(user_id, display_name)
+                        
+                        # Hisob uchun intervalni hisoblash
+                        next_interval = random.randint(account_min, account_max)
+                        logger.info(f"⏰ {user_id}_{display_name}: {sent_to_groups} guruhga yuborildi, keyingisi {next_interval} daqiqadan keyin")
                     
-                # Umumiy kutish
-                await asyncio.sleep(60)
+                    # Hisoblar o'rtasida 5-10 soniya kutish
+                    await asyncio.sleep(random.uniform(5, 10))
             
-            else:
-                await asyncio.sleep(30)
-                
+            if total_sent > 0 or total_failed > 0:
+                last_send_time = current_time.strftime("%H:%M:%S")
+                logger.info(f"📊 NATIJA: {total_sent} ta xabar yuborildi, {total_failed} ta xatolik")
+            
+            # Har bir loop aylanishi o'rtasida 60 soniya kutish
+            await asyncio.sleep(60)
+            
         except Exception as e:
             logger.error(f"Auto send loop xatosi: {e}")
-            await asyncio.sleep(30)
+            import traceback
+            logger.error(traceback.format_exc())
+            await asyncio.sleep(60)
 
 def start_auto_send():
     """Auto send loopni alohida threadda ishga tushirish"""
@@ -3844,9 +4207,9 @@ def main():
         print("\n🚀 Bot ishga tushmoqda...")
         print("👑 Admin: /start ni bosing")
         print("\n🎯 YANGI KOMMANDALAR:")
-        print("  /code DISPLAY_NAME KOD - SMS kodini kiritish")
-        print("  /password DISPLAY_NAME PAROL - 2FA parolini kiritish")
-        print("  /test DISPLAY_NAME - Sessionni test qilish")
+        print("  /code DISPLAY_NAME USER_ID KOD - SMS kodini kiritish")
+        print("  /password DISPLAY_NAME USER_ID PAROL - 2FA parolini kiritish")
+        print("  /test DISPLAY_NAME USER_ID - Sessionni test qilish")
         print("\n📝 Asosiy komandalar:")
         print("  /add ID KUNLAR - Ruxsat berish")
         print("  /reject ID - So'rovni rad etish")
@@ -3856,6 +4219,15 @@ def main():
         print("  • CHAT_ID:MESSAGE_ID formatida bazaga yoziladi")
         print("  • Server xotirasi tejiladi")
         print("  • Obuna tugaganda arxiv kanaldan o'chiriladi")
+        print("\n📁 SESSION FAYL FORMATI:")
+        print("  • Yangi format: userid_displayname.session")
+        print("  • Har bir foydalanuvchi uchun alohida")
+        print("  • Avtomatik migratsiya qilinadi")
+        print("\n⏰ INTERVAL TIZIMI:")
+        print("  • Har bir hisob uchun alohida interval")
+        print("  • Foydalanuvchi har bir hisobiga alohida interval sozlashi mumkin")
+        print("  • Admin ham barcha hisob intervalini boshqarishi mumkin")
+        print("  • Har bir hisob o'z intervalida ishlaydi")
         print("="*60)
         
         # Polling
@@ -3864,6 +4236,8 @@ def main():
     except Exception as e:
         print(f"\n❌ Xatolik: {e}")
         logger.error(f"Main xatosi: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()

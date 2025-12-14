@@ -23,7 +23,7 @@ except ImportError:
 
 # ========== KONFIGURATSIYA ==========
 ADMIN_ID = 2091226701  # O'zingizning Telegram ID'ingiz
-BOT_TOKEN = "8289173554:AAERukM8xkPMbBZPi2ot8nvPzxC2s5T5xDQ"  # @BotFather dan olingan token
+BOT_TOKEN = "8150864683:AAHreK1C1UehEhKpHP8xcoyjwo4i2xFpwJs"  # @BotFather dan olingan token
 
 # Telegram API ma'lumotlari (my.telegram.org dan oling)
 API_ID = 16307694
